@@ -1,52 +1,71 @@
-#!/usr/bin/env python
-
+import importlib
+import json
+import pkgutil
+import re
+import threading
+import time
+import warnings
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest import mock
+
 import numpy
 import pytest
+import requests
+from google.protobuf import descriptor_pool
 
-from mlflow.exceptions import MlflowException, RestException
+import mlflow.protos
+from mlflow.deployments.databricks import DatabricksDeploymentClient
+from mlflow.environment_variables import (
+    _MLFLOW_DATABRICKS_TRAFFIC_ID,
+    MLFLOW_HTTP_REQUEST_BACKOFF_FACTOR,
+    MLFLOW_HTTP_REQUEST_MAX_RETRIES,
+    MLFLOW_HTTP_REQUEST_TIMEOUT,
+)
+from mlflow.exceptions import InvalidUrlException, MlflowException, RestException
+
+# Imported to register the response messages they define with the default descriptor pool.
+from mlflow.protos import (
+    databricks_artifacts_pb2,  # noqa: F401
+    databricks_filesystem_service_pb2,  # noqa: F401
+    databricks_pb2,
+    databricks_tracing_pb2,  # noqa: F401
+    databricks_uc_registry_messages_pb2,  # noqa: F401
+    unity_catalog_messages_pb2,  # noqa: F401
+    unity_catalog_prompt_service_pb2,  # noqa: F401
+)
+from mlflow.protos.databricks_pb2 import ENDPOINT_NOT_FOUND, ErrorCode
+from mlflow.protos.model_registry_pb2 import CreateModelVersion, CreateRegisteredModel
+from mlflow.protos.service_pb2 import (
+    CreateExperiment,
+    CreateLoggedModel,
+    CreateRun,
+    DeleteTag,
+    GetRun,
+    LogBatch,
+    SearchRuns,
+)
 from mlflow.pyfunc.scoring_server import NumpyEncoder
+from mlflow.tracking.request_header.default_request_header_provider import (
+    _CLIENT_VERSION,
+    _USER_AGENT,
+    DefaultRequestHeaderProvider,
+)
 from mlflow.utils.rest_utils import (
-    http_request,
-    http_request_safe,
+    _DATABRICKS_SDK_RETRY_AFTER_SECS_DEPRECATION_WARNING,
+    _RETRY_SAFE_POST_RESPONSES,
     MlflowHostCreds,
-    _DEFAULT_HEADERS,
+    _can_parse_as_json_object,
+    augmented_raise_for_status,
     call_endpoint,
     call_endpoints,
+    get_workspace_client,
+    http_request,
+    http_request_safe,
 )
-from mlflow.protos.service_pb2 import GetRun
-from mlflow.protos.databricks_pb2 import ENDPOINT_NOT_FOUND, ErrorCode
+from mlflow.utils.workspace_context import WorkspaceContext
+from mlflow.utils.workspace_utils import WORKSPACE_HEADER_NAME
+
 from tests import helper_functions
-
-
-def test_well_formed_json_error_response():
-    with mock.patch("requests.Session.request") as request_mock:
-        host_only = MlflowHostCreds("http://my-host")
-        response_mock = mock.MagicMock()
-        response_mock.status_code = 400
-        response_mock.text = "{}"  # well-formed JSON error response
-        request_mock.return_value = response_mock
-
-        response_proto = GetRun.Response()
-        with pytest.raises(RestException):
-            call_endpoint(host_only, "/my/endpoint", "GET", "", response_proto)
-
-
-def test_non_json_ok_response():
-    with mock.patch("requests.Session.request") as request_mock:
-        host_only = MlflowHostCreds("http://my-host")
-        response_mock = mock.MagicMock()
-        response_mock.status_code = 200
-        response_mock.text = "<html></html>"
-        request_mock.return_value = response_mock
-
-        response_proto = GetRun.Response()
-        with pytest.raises(
-            MlflowException,
-            match="API request to endpoint was successful but the response body was not "
-            "in a valid JSON format",
-        ):
-            call_endpoint(host_only, "/api/2.0/fetch-model", "GET", "", response_proto)
 
 
 @pytest.mark.parametrize(
@@ -58,13 +77,237 @@ def test_non_json_ok_response():
     ],
 )
 def test_malformed_json_error_response(response_mock):
-    with mock.patch("requests.Session.request") as request_mock:
+    with mock.patch("requests.Session.request", return_value=response_mock):
         host_only = MlflowHostCreds("http://my-host")
-        request_mock.return_value = response_mock
 
         response_proto = GetRun.Response()
-        with pytest.raises(MlflowException):
-            call_endpoint(host_only, "/my/endpoint", "GET", "", response_proto)
+        with pytest.raises(
+            MlflowException, match="API request to endpoint /my/endpoint failed with error code 400"
+        ):
+            call_endpoint(host_only, "/my/endpoint", "GET", None, response_proto)
+
+
+@pytest.mark.parametrize("max_retries", [0, 2])
+def test_call_endpoint_surfaces_server_error_after_retries_on_5xx(monkeypatch, max_retries):
+    monkeypatch.setenv(MLFLOW_HTTP_REQUEST_MAX_RETRIES.name, str(max_retries))
+    monkeypatch.setenv(MLFLOW_HTTP_REQUEST_BACKOFF_FACTOR.name, "0")
+    request_count = 0
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            nonlocal request_count
+            request_count += 1
+            body = json.dumps({"error_code": "INTERNAL_ERROR", "message": "Server-side failure"})
+            self.send_response(500)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body.encode())
+
+        def log_message(self, *args):
+            pass
+
+    with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
+        thread = threading.Thread(target=server.serve_forever, name="test-5xx-server", daemon=True)
+        thread.start()
+        try:
+            host_creds = MlflowHostCreds(f"http://127.0.0.1:{server.server_port}")
+            with pytest.raises(RestException, match="INTERNAL_ERROR: Server-side failure"):
+                call_endpoint(host_creds, "/my/endpoint", "GET", None, GetRun.Response())
+        finally:
+            server.shutdown()
+            thread.join()
+
+    assert request_count == max_retries + 1
+
+
+def _send_post(response_proto, status_code=200, delay_seconds=0, headers=None):
+    request_count = 0
+    client_done = threading.Event()
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            nonlocal request_count
+            request_count += 1
+            self.rfile.read(int(self.headers["Content-Length"]))
+            if client_done.wait(delay_seconds):
+                return
+            body = json.dumps({"error_code": "TEMPORARILY_UNAVAILABLE", "message": "Failure"})
+            self.send_response(status_code)
+            for name, value in (headers or {}).items():
+                self.send_header(name, value)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body.encode())
+
+        def log_message(self, *args):
+            pass
+
+    with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
+        thread = threading.Thread(target=server.serve_forever, name="test-post-server", daemon=True)
+        thread.start()
+        try:
+            host_creds = MlflowHostCreds(f"http://127.0.0.1:{server.server_port}")
+            with pytest.raises(MlflowException, match=r"Failure|timeout") as exc_info:
+                call_endpoint(host_creds, "/my/endpoint", "POST", "{}", response_proto)
+        finally:
+            client_done.set()
+            server.shutdown()
+            thread.join()
+    return request_count, str(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    ("response_proto", "status_code", "expected_requests"),
+    [
+        # The write may have been committed before these responses, so it isn't sent again.
+        (CreateRun.Response(), 500, 1),
+        (CreateRun.Response(), 502, 1),
+        (CreateRun.Response(), 503, 1),
+        (CreateRun.Response(), 504, 1),
+        # These mean the server didn't receive the request, so the write is retried.
+        (CreateRun.Response(), 408, 3),
+        (CreateRun.Response(), 429, 3),
+        # Reads and idempotent writes keep the full retry policy.
+        (SearchRuns.Response(), 504, 3),
+        (LogBatch.Response(), 504, 3),
+    ],
+)
+def test_call_endpoint_retries_post_writes_only_when_unprocessed(
+    monkeypatch, response_proto, status_code, expected_requests
+):
+    monkeypatch.setenv(MLFLOW_HTTP_REQUEST_MAX_RETRIES.name, "2")
+    monkeypatch.setenv(MLFLOW_HTTP_REQUEST_BACKOFF_FACTOR.name, "0")
+
+    request_count, _ = _send_post(response_proto, status_code)
+
+    assert request_count == expected_requests
+
+
+@pytest.mark.parametrize(
+    ("response_proto", "status_code", "expected_requests"),
+    [
+        # A proxy can add `Retry-After` to a 503 sent after the server committed the write.
+        (CreateRun.Response(), 503, 1),
+        (CreateRun.Response(), 413, 1),
+        (CreateRun.Response(), 429, 3),
+        # 413 isn't in the default retry codes, so reads retry it only because of the header.
+        (SearchRuns.Response(), 413, 3),
+    ],
+)
+def test_call_endpoint_retries_on_retry_after_only_for_retry_safe_requests(
+    monkeypatch, response_proto, status_code, expected_requests
+):
+    monkeypatch.setenv(MLFLOW_HTTP_REQUEST_MAX_RETRIES.name, "2")
+    monkeypatch.setenv(MLFLOW_HTTP_REQUEST_BACKOFF_FACTOR.name, "0")
+
+    request_count, _ = _send_post(response_proto, status_code, headers={"Retry-After": "0"})
+
+    assert request_count == expected_requests
+
+
+def test_call_endpoint_waits_for_retry_after_before_retrying_a_write(monkeypatch):
+    monkeypatch.setenv(MLFLOW_HTTP_REQUEST_MAX_RETRIES.name, "1")
+    monkeypatch.setenv(MLFLOW_HTTP_REQUEST_BACKOFF_FACTOR.name, "0")
+
+    start = time.monotonic()
+    request_count, _ = _send_post(CreateRun.Response(), 429, headers={"Retry-After": "1"})
+
+    assert request_count == 2
+    assert time.monotonic() - start >= 1
+
+
+@pytest.mark.parametrize(
+    ("response_proto", "expected_requests"),
+    [(CreateRun.Response(), 1), (SearchRuns.Response(), 2), (LogBatch.Response(), 2)],
+)
+def test_call_endpoint_retries_post_read_timeout_only_when_retry_safe(
+    monkeypatch, response_proto, expected_requests
+):
+    monkeypatch.setenv(MLFLOW_HTTP_REQUEST_MAX_RETRIES.name, "1")
+    monkeypatch.setenv(MLFLOW_HTTP_REQUEST_BACKOFF_FACTOR.name, "0")
+    monkeypatch.setenv(MLFLOW_HTTP_REQUEST_TIMEOUT.name, "1")
+
+    request_count, _ = _send_post(response_proto, delay_seconds=2)
+
+    assert request_count == expected_requests
+
+
+def test_call_endpoint_explains_how_to_increase_timeout_for_a_write(monkeypatch):
+    monkeypatch.setenv(MLFLOW_HTTP_REQUEST_TIMEOUT.name, "1")
+
+    _, message = _send_post(CreateRun.Response(), delay_seconds=2)
+
+    assert MLFLOW_HTTP_REQUEST_TIMEOUT.name in message
+
+
+def test_call_endpoint_leaves_databricks_sdk_retries_unchanged():
+    response = mock.MagicMock()
+    response.status_code = 200
+    response.text = "{}"
+    host_creds = MlflowHostCreds("https://my-host", use_databricks_sdk=True)
+    with mock.patch("mlflow.utils.rest_utils.http_request", return_value=response) as mock_http:
+        call_endpoint(host_creds, "/my/endpoint", "POST", "{}", CreateRun.Response())
+
+    mock_http.assert_called_once_with(
+        host_creds=host_creds,
+        endpoint="/my/endpoint",
+        method="POST",
+        raise_on_status=False,
+        json={},
+    )
+
+
+@pytest.mark.parametrize("name", sorted(_RETRY_SAFE_POST_RESPONSES))
+def test_retry_safe_post_responses_are_proto_messages(name):
+    descriptor_pool.Default().FindMessageTypeByName(name)
+
+
+def _post_rpcs():
+    for module_info in pkgutil.iter_modules(mlflow.protos.__path__):
+        if not module_info.name.endswith("_pb2"):
+            continue
+        module = importlib.import_module(f"mlflow.protos.{module_info.name}")
+        for service in module.DESCRIPTOR.services_by_name.values():
+            for method in service.methods:
+                options = method.GetOptions()
+                if options.HasExtension(databricks_pb2.rpc) and any(
+                    endpoint.method == "POST"
+                    for endpoint in options.Extensions[databricks_pb2.rpc].endpoints
+                ):
+                    yield method
+
+
+def test_read_post_rpcs_are_retry_safe():
+    # Matches RPC names against their declared response messages. Some stores pass a different
+    # response message (e.g. Unity Catalog credential requests), so this doesn't cover every call.
+    # Read-style names for RPCs that change server state.
+    writes_with_read_names = {"mlflow.review_queues.GetOrCreateUserQueue"}
+    missing = [
+        method.full_name
+        for method in _post_rpcs()
+        if method.input_type.name.startswith(("Search", "Get", "BatchGet", "Query", "Calculate"))
+        and method.input_type.full_name not in writes_with_read_names
+        and method.output_type.full_name not in _RETRY_SAFE_POST_RESPONSES
+    ]
+    assert missing == []
+
+
+@pytest.mark.parametrize(
+    "response_proto",
+    [
+        # These allocate a new ID or version, or fail when repeated.
+        CreateExperiment.Response(),
+        CreateLoggedModel.Response(),
+        CreateModelVersion.Response(),
+        CreateRegisteredModel.Response(),
+        CreateRun.Response(),
+        DeleteTag.Response(),
+    ],
+)
+def test_non_idempotent_writes_are_not_retry_safe(response_proto):
+    assert response_proto.DESCRIPTOR.full_name not in _RETRY_SAFE_POST_RESPONSES
 
 
 def test_call_endpoints():
@@ -77,12 +320,10 @@ def test_call_endpoints():
         host_only = MlflowHostCreds("http://my-host")
         endpoints = [("/my/endpoint", "POST"), ("/my/endpoint", "GET")]
         resp = call_endpoints(host_only, endpoints, "", response_proto)
-        mock_call_endpoint.assert_has_calls(
-            [
-                mock.call(host_only, endpoint, method, "", response_proto)
-                for endpoint, method in endpoints
-            ]
-        )
+        mock_call_endpoint.assert_has_calls([
+            mock.call(host_only, endpoint, method, "", response_proto, None)
+            for endpoint, method in endpoints
+        ])
         assert resp is None
 
 
@@ -95,159 +336,377 @@ def test_call_endpoints_raises_exceptions():
         ]
         host_only = MlflowHostCreds("http://my-host")
         endpoints = [("/my/endpoint", "POST"), ("/my/endpoint", "GET")]
-        with pytest.raises(RestException):
+        with pytest.raises(RestException, match="ENDPOINT_NOT_FOUND"):
             call_endpoints(host_only, endpoints, "", response_proto)
         mock_call_endpoint.side_effect = [RestException({}), None]
-        with pytest.raises(RestException):
+        with pytest.raises(RestException, match="INTERNAL_ERROR"):
             call_endpoints(host_only, endpoints, "", response_proto)
 
 
-@mock.patch("requests.Session.request")
-def test_http_request_hostonly(request):
+def test_http_request_hostonly():
     host_only = MlflowHostCreds("http://my-host")
     response = mock.MagicMock()
     response.status_code = 200
-    request.return_value = response
-    http_request(host_only, "/my/endpoint", "GET")
-    request.assert_called_with(
-        "GET",
-        "http://my-host/my/endpoint",
-        verify=True,
-        headers=_DEFAULT_HEADERS,
-        timeout=120,
-    )
+    with mock.patch("requests.Session.request", return_value=response) as mock_request:
+        http_request(host_only, "/my/endpoint", "GET")
+        mock_request.assert_called_with(
+            "GET",
+            "http://my-host/my/endpoint",
+            allow_redirects=True,
+            verify=True,
+            headers=DefaultRequestHeaderProvider().request_headers(),
+            timeout=120,
+        )
 
 
-@mock.patch("requests.Session.request")
-def test_http_request_cleans_hostname(request):
+def test_http_request_includes_workspace_header_for_mlflow_routes():
+    host_only = MlflowHostCreds("http://my-host")
+    response = mock.MagicMock()
+    response.status_code = 200
+    with WorkspaceContext("team-a"):
+        with mock.patch("requests.Session.request", return_value=response) as mock_request:
+            http_request(host_only, "/api/2.0/mlflow/runs/search", "GET")
+        headers = mock_request.call_args.kwargs["headers"]
+        assert headers[WORKSPACE_HEADER_NAME] == "team-a"
+
+
+def test_http_request_omits_workspace_header_for_workspace_admin_routes():
+    host_only = MlflowHostCreds("http://my-host")
+    response = mock.MagicMock()
+    response.status_code = 200
+    with WorkspaceContext("team-a"):
+        with mock.patch("requests.Session.request", return_value=response) as mock_request:
+            http_request(host_only, "/api/3.0/mlflow/workspaces/team-a", "GET")
+        headers = mock_request.call_args.kwargs["headers"]
+        assert WORKSPACE_HEADER_NAME not in headers
+
+
+def test_http_request_cleans_hostname():
     # Add a trailing slash, should be removed.
     host_only = MlflowHostCreds("http://my-host/")
     response = mock.MagicMock()
     response.status_code = 200
-    request.return_value = response
-    http_request(host_only, "/my/endpoint", "GET")
-    request.assert_called_with(
-        "GET",
-        "http://my-host/my/endpoint",
-        verify=True,
-        headers=_DEFAULT_HEADERS,
-        timeout=120,
-    )
+    with mock.patch("requests.Session.request", return_value=response) as mock_request:
+        http_request(host_only, "/my/endpoint", "GET")
+        mock_request.assert_called_with(
+            "GET",
+            "http://my-host/my/endpoint",
+            allow_redirects=True,
+            verify=True,
+            headers=DefaultRequestHeaderProvider().request_headers(),
+            timeout=120,
+        )
 
 
-@mock.patch("requests.Session.request")
-def test_http_request_with_basic_auth(request):
+def test_http_request_with_basic_auth():
     host_only = MlflowHostCreds("http://my-host", username="user", password="pass")
     response = mock.MagicMock()
     response.status_code = 200
-    request.return_value = response
-    http_request(host_only, "/my/endpoint", "GET")
-    headers = dict(_DEFAULT_HEADERS)
-    headers["Authorization"] = "Basic dXNlcjpwYXNz"
-    request.assert_called_with(
-        "GET",
-        "http://my-host/my/endpoint",
-        verify=True,
-        headers=headers,
-        timeout=120,
+    with mock.patch("requests.Session.request", return_value=response) as mock_request:
+        http_request(host_only, "/my/endpoint", "GET")
+        headers = DefaultRequestHeaderProvider().request_headers()
+        headers["Authorization"] = "Basic dXNlcjpwYXNz"
+        mock_request.assert_called_with(
+            "GET",
+            "http://my-host/my/endpoint",
+            allow_redirects=True,
+            verify=True,
+            headers=headers,
+            timeout=120,
+        )
+
+
+@pytest.mark.parametrize("auth", ["kubernetes", "kubernetes-namespaced"])
+@pytest.mark.parametrize(
+    ("token", "expected_authorization"),
+    [(None, None), ("my-token", "Bearer my-token")],
+)
+def test_http_request_with_kubernetes_auth_ignores_basic_auth(auth, token, expected_authorization):
+    host_creds = MlflowHostCreds(
+        "http://my-host",
+        username="user",
+        password="pass",
+        token=token,
+        auth=auth,
     )
+    response = mock.MagicMock(status_code=200)
+    request_auth = mock.MagicMock()
+
+    with (
+        mock.patch("requests.Session.request", return_value=response) as mock_request,
+        mock.patch(
+            "mlflow.tracking.request_auth.registry.fetch_auth", return_value=request_auth
+        ) as mock_fetch_auth,
+    ):
+        http_request(host_creds, "/my/endpoint", "GET")
+
+    mock_fetch_auth.assert_called_once_with(auth)
+    headers = mock_request.call_args.kwargs["headers"]
+    assert headers.get("Authorization") == expected_authorization
+    assert mock_request.call_args.kwargs["auth"] is request_auth
 
 
-@mock.patch("requests.Session.request")
-def test_http_request_with_token(request):
+def test_http_request_with_aws_sigv4(monkeypatch):
+    from requests_auth_aws_sigv4 import AWSSigV4
+
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "access-key")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "secret-key")
+    monkeypatch.setenv("AWS_DEFAULT_REGION", "eu-west-1")
+    aws_sigv4 = MlflowHostCreds("http://my-host", aws_sigv4=True)
+    response = mock.MagicMock()
+    response.status_code = 200
+
+    class AuthMatcher:
+        def __eq__(self, other):
+            return isinstance(other, AWSSigV4)
+
+    with mock.patch("requests.Session.request", return_value=response) as mock_request:
+        http_request(aws_sigv4, "/my/endpoint", "GET")
+        mock_request.assert_called_once_with(
+            "GET",
+            "http://my-host/my/endpoint",
+            allow_redirects=True,
+            verify=mock.ANY,
+            headers=mock.ANY,
+            timeout=mock.ANY,
+            auth=AuthMatcher(),
+        )
+
+
+def test_http_request_with_auth():
+    mock_fetch_auth = {"test_name": "test_auth_value"}
+    auth = "test_auth_name"
+    host_only = MlflowHostCreds("http://my-host", auth=auth)
+    response = mock.MagicMock()
+    response.status_code = 200
+    with (
+        mock.patch("requests.Session.request", return_value=response) as mock_request,
+        mock.patch(
+            "mlflow.tracking.request_auth.registry.fetch_auth", return_value=mock_fetch_auth
+        ) as mock_fetch_auth_call,
+    ):
+        http_request(host_only, "/my/endpoint", "GET")
+
+        mock_fetch_auth_call.assert_called_with(auth)
+
+        mock_request.assert_called_with(
+            "GET",
+            "http://my-host/my/endpoint",
+            allow_redirects=True,
+            verify=mock.ANY,
+            headers=mock.ANY,
+            timeout=mock.ANY,
+            auth=mock_fetch_auth,
+        )
+
+
+def test_http_request_with_token():
     host_only = MlflowHostCreds("http://my-host", token="my-token")
     response = mock.MagicMock()
     response.status_code = 200
-    request.return_value = response
-    http_request(host_only, "/my/endpoint", "GET")
-    headers = dict(_DEFAULT_HEADERS)
-    headers["Authorization"] = "Bearer my-token"
-    request.assert_called_with(
-        "GET",
-        "http://my-host/my/endpoint",
-        verify=True,
-        headers=headers,
-        timeout=120,
-    )
+    with mock.patch("requests.Session.request", return_value=response) as mock_request:
+        http_request(host_only, "/my/endpoint", "GET")
+        headers = DefaultRequestHeaderProvider().request_headers()
+        headers["Authorization"] = "Bearer my-token"
+        mock_request.assert_called_with(
+            "GET",
+            "http://my-host/my/endpoint",
+            allow_redirects=True,
+            verify=True,
+            headers=headers,
+            timeout=120,
+        )
 
 
-@mock.patch("requests.Session.request")
-def test_http_request_with_insecure(request):
+def test_http_request_with_insecure():
     host_only = MlflowHostCreds("http://my-host", ignore_tls_verification=True)
     response = mock.MagicMock()
     response.status_code = 200
-    request.return_value = response
-    http_request(host_only, "/my/endpoint", "GET")
-    request.assert_called_with(
-        "GET",
-        "http://my-host/my/endpoint",
-        verify=False,
-        headers=_DEFAULT_HEADERS,
-        timeout=120,
-    )
+    with mock.patch("requests.Session.request", return_value=response) as mock_request:
+        http_request(host_only, "/my/endpoint", "GET")
+        mock_request.assert_called_with(
+            "GET",
+            "http://my-host/my/endpoint",
+            allow_redirects=True,
+            verify=False,
+            headers=DefaultRequestHeaderProvider().request_headers(),
+            timeout=120,
+        )
 
 
-@mock.patch("requests.Session.request")
-def test_http_request_client_cert_path(request):
+def test_http_request_client_cert_path():
     host_only = MlflowHostCreds("http://my-host", client_cert_path="/some/path")
     response = mock.MagicMock()
     response.status_code = 200
-    request.return_value = response
-    http_request(host_only, "/my/endpoint", "GET")
-    request.assert_called_with(
-        "GET",
-        "http://my-host/my/endpoint",
-        verify=True,
-        cert="/some/path",
-        headers=_DEFAULT_HEADERS,
-        timeout=120,
-    )
+    with mock.patch("requests.Session.request", return_value=response) as mock_request:
+        http_request(host_only, "/my/endpoint", "GET")
+        mock_request.assert_called_with(
+            "GET",
+            "http://my-host/my/endpoint",
+            allow_redirects=True,
+            verify=True,
+            cert="/some/path",
+            headers=DefaultRequestHeaderProvider().request_headers(),
+            timeout=120,
+        )
 
 
-@mock.patch("requests.Session.request")
-def test_http_request_server_cert_path(request):
+def test_http_request_server_cert_path():
     host_only = MlflowHostCreds("http://my-host", server_cert_path="/some/path")
     response = mock.MagicMock()
     response.status_code = 200
-    request.return_value = response
-    http_request(host_only, "/my/endpoint", "GET")
-    request.assert_called_with(
-        "GET",
-        "http://my-host/my/endpoint",
-        verify="/some/path",
-        headers=_DEFAULT_HEADERS,
-        timeout=120,
-    )
+    with mock.patch("requests.Session.request", return_value=response) as mock_request:
+        http_request(host_only, "/my/endpoint", "GET")
+        mock_request.assert_called_with(
+            "GET",
+            "http://my-host/my/endpoint",
+            allow_redirects=True,
+            verify="/some/path",
+            headers=DefaultRequestHeaderProvider().request_headers(),
+            timeout=120,
+        )
 
 
-@pytest.mark.large
-@mock.patch("requests.Session.request")
-def test_http_request_request_headers(request):
-    """This test requires the package in tests/resources/mlflow-test-plugin to be installed"""
+def test_http_request_with_content_type_header():
+    host_only = MlflowHostCreds("http://my-host", token="my-token")
+    response = mock.MagicMock()
+    response.status_code = 200
+    extra_headers = {"Content-Type": "text/plain"}
+    with mock.patch("requests.Session.request", return_value=response) as mock_request:
+        http_request(host_only, "/my/endpoint", "GET", extra_headers=extra_headers)
+        headers = DefaultRequestHeaderProvider().request_headers()
+        headers["Authorization"] = "Bearer my-token"
+        headers["Content-Type"] = "text/plain"
+        mock_request.assert_called_with(
+            "GET",
+            "http://my-host/my/endpoint",
+            allow_redirects=True,
+            verify=True,
+            headers=headers,
+            timeout=120,
+        )
 
+
+def test_http_request_request_headers():
     from mlflow_test_plugin.request_header_provider import PluginRequestHeaderProvider
 
     # The test plugin's request header provider always returns False from in_context to avoid
     # polluting request headers in developers' environments. The following mock overrides this to
     # perform the integration test.
-    with mock.patch.object(PluginRequestHeaderProvider, "in_context", return_value=True):
+    response = mock.MagicMock()
+    response.status_code = 200
+    with (
+        mock.patch("requests.Session.request", return_value=response) as mock_request,
+        mock.patch.object(PluginRequestHeaderProvider, "in_context", return_value=True),
+    ):
         host_only = MlflowHostCreds("http://my-host", server_cert_path="/some/path")
-
-        response = mock.MagicMock()
-        response.status_code = 200
-        request.return_value = response
         http_request(host_only, "/my/endpoint", "GET")
-        request.assert_called_with(
+        mock_request.assert_called_with(
             "GET",
             "http://my-host/my/endpoint",
+            allow_redirects=True,
             verify="/some/path",
-            headers={**_DEFAULT_HEADERS, "test": "header"},
+            headers={**DefaultRequestHeaderProvider().request_headers(), "test": "header"},
             timeout=120,
         )
 
 
+def test_http_request_request_headers_default():
+    from mlflow_test_plugin.request_header_provider import PluginRequestHeaderProvider
+
+    # The test plugin's request header provider always returns False from in_context to avoid
+    # polluting request headers in developers' environments. The following mock overrides this to
+    # perform the integration test.
+    host_only = MlflowHostCreds("http://my-host", server_cert_path="/some/path")
+    default_headers = DefaultRequestHeaderProvider().request_headers()
+    expected_headers = {
+        _USER_AGENT: "{} {}".format(default_headers[_USER_AGENT], "test_user_agent"),
+        _CLIENT_VERSION: "{} {}".format(default_headers[_CLIENT_VERSION], "test_client_version"),
+    }
+
+    response = mock.MagicMock()
+    response.status_code = 200
+    with (
+        mock.patch("requests.Session.request", return_value=response) as mock_request,
+        mock.patch.object(PluginRequestHeaderProvider, "in_context", return_value=True),
+        mock.patch.object(
+            PluginRequestHeaderProvider,
+            "request_headers",
+            return_value={_USER_AGENT: "test_user_agent", _CLIENT_VERSION: "test_client_version"},
+        ),
+    ):
+        http_request(host_only, "/my/endpoint", "GET")
+        mock_request.assert_called_with(
+            "GET",
+            "http://my-host/my/endpoint",
+            allow_redirects=True,
+            verify="/some/path",
+            headers=expected_headers,
+            timeout=120,
+        )
+
+
+def test_http_request_request_headers_default_and_extra_header():
+    from mlflow_test_plugin.request_header_provider import PluginRequestHeaderProvider
+
+    # The test plugin's request header provider always returns False from in_context to avoid
+    # polluting request headers in developers' environments. The following mock overrides this to
+    # perform the integration test.
+    host_only = MlflowHostCreds("http://my-host", server_cert_path="/some/path")
+    default_headers = DefaultRequestHeaderProvider().request_headers()
+    expected_headers = {
+        _USER_AGENT: "{} {}".format(default_headers[_USER_AGENT], "test_user_agent"),
+        _CLIENT_VERSION: "{} {}".format(default_headers[_CLIENT_VERSION], "test_client_version"),
+        "header": "value",
+    }
+
+    response = mock.MagicMock()
+    response.status_code = 200
+    with (
+        mock.patch("requests.Session.request", return_value=response) as mock_request,
+        mock.patch.object(PluginRequestHeaderProvider, "in_context", return_value=True),
+        mock.patch.object(
+            PluginRequestHeaderProvider,
+            "request_headers",
+            return_value={
+                _USER_AGENT: "test_user_agent",
+                _CLIENT_VERSION: "test_client_version",
+                "header": "value",
+            },
+        ),
+    ):
+        http_request(host_only, "/my/endpoint", "GET")
+        mock_request.assert_called_with(
+            "GET",
+            "http://my-host/my/endpoint",
+            allow_redirects=True,
+            verify="/some/path",
+            headers=expected_headers,
+            timeout=120,
+        )
+
+
+def test_http_request_with_invalid_url_raise_invalid_url_exception():
+    host_only = MlflowHostCreds("http://my-host")
+
+    with pytest.raises(InvalidUrlException, match="Invalid url: http://my-host/invalid_url"):
+        with mock.patch("requests.Session.request", side_effect=requests.exceptions.InvalidURL):
+            http_request(host_only, "/invalid_url", "GET")
+
+
+def test_http_request_with_invalid_url_raise_mlflow_exception():
+    host_only = MlflowHostCreds("http://my-host")
+
+    with pytest.raises(MlflowException, match="Invalid url: http://my-host/invalid_url"):
+        with mock.patch("requests.Session.request", side_effect=requests.exceptions.InvalidURL):
+            http_request(host_only, "/invalid_url", "GET")
+
+
 def test_ignore_tls_verification_not_server_cert_path():
-    with pytest.raises(MlflowException):
+    with pytest.raises(
+        MlflowException,
+        match="When 'ignore_tls_verification' is true then 'server_cert_path' must not be set",
+    ):
         MlflowHostCreds(
             "http://my-host",
             ignore_tls_verification=True,
@@ -255,42 +714,40 @@ def test_ignore_tls_verification_not_server_cert_path():
         )
 
 
-@mock.patch("requests.Session.request")
-def test_http_request_wrapper(request):
+def test_http_request_wrapper():
     host_only = MlflowHostCreds("http://my-host", ignore_tls_verification=True)
     response = mock.MagicMock()
     response.status_code = 200
     response.text = "{}"
-    request.return_value = response
-    http_request_safe(host_only, "/my/endpoint", "GET")
-    request.assert_called_with(
-        "GET",
-        "http://my-host/my/endpoint",
-        verify=False,
-        headers=_DEFAULT_HEADERS,
-        timeout=120,
-    )
-    response.text = "non json"
-    request.return_value = response
-    http_request_safe(host_only, "/my/endpoint", "GET")
-    request.assert_called_with(
-        "GET",
-        "http://my-host/my/endpoint",
-        verify=False,
-        headers=_DEFAULT_HEADERS,
-        timeout=120,
-    )
-    response.status_code = 400
-    response.text = ""
-    request.return_value = response
-    with pytest.raises(MlflowException, match="Response body"):
+    with mock.patch("requests.Session.request", return_value=response) as mock_request:
         http_request_safe(host_only, "/my/endpoint", "GET")
-    response.text = (
-        '{"error_code": "RESOURCE_DOES_NOT_EXIST", "message": "Node type not supported"}'
-    )
-    request.return_value = response
-    with pytest.raises(RestException, match="RESOURCE_DOES_NOT_EXIST: Node type not supported"):
+        mock_request.assert_called_with(
+            "GET",
+            "http://my-host/my/endpoint",
+            allow_redirects=True,
+            verify=False,
+            headers=DefaultRequestHeaderProvider().request_headers(),
+            timeout=120,
+        )
+        response.text = "non json"
         http_request_safe(host_only, "/my/endpoint", "GET")
+        mock_request.assert_called_with(
+            "GET",
+            "http://my-host/my/endpoint",
+            allow_redirects=True,
+            verify=False,
+            headers=DefaultRequestHeaderProvider().request_headers(),
+            timeout=120,
+        )
+        response.status_code = 400
+        response.text = ""
+        with pytest.raises(MlflowException, match="Response body"):
+            http_request_safe(host_only, "/my/endpoint", "GET")
+        response.text = (
+            '{"error_code": "RESOURCE_DOES_NOT_EXIST", "message": "Node type not supported"}'
+        )
+        with pytest.raises(RestException, match="RESOURCE_DOES_NOT_EXIST: Node type not supported"):
+            http_request_safe(host_only, "/my/endpoint", "GET")
 
 
 def test_numpy_encoder():
@@ -302,8 +759,588 @@ def test_numpy_encoder():
 
 def test_numpy_encoder_fail():
     if not hasattr(numpy, "float128"):
-        pytest.skip("numpy on exit" "this platform has no float128")
+        pytest.skip("numpy on exit this platform has no float128")
     test_number = numpy.float128
-    with pytest.raises(TypeError):
-        ne = NumpyEncoder()
+    ne = NumpyEncoder()
+    with pytest.raises(TypeError, match="not JSON serializable"):
         ne.default(test_number)
+
+
+def test_can_parse_as_json_object():
+    assert _can_parse_as_json_object("{}")
+    assert _can_parse_as_json_object('{"a": "b"}')
+    assert _can_parse_as_json_object('{"a": {"b": "c"}}')
+    assert not _can_parse_as_json_object("[0, 1, 2]")
+    assert not _can_parse_as_json_object('"abc"')
+    assert not _can_parse_as_json_object("123")
+
+
+def test_http_request_customize_config(monkeypatch):
+    with mock.patch(
+        "mlflow.utils.rest_utils._get_http_response_with_retries"
+    ) as mock_get_http_response_with_retries:
+        host_only = MlflowHostCreds("http://my-host")
+        monkeypatch.delenv("MLFLOW_HTTP_REQUEST_MAX_RETRIES", raising=False)
+        monkeypatch.delenv("MLFLOW_HTTP_REQUEST_BACKOFF_FACTOR", raising=False)
+        monkeypatch.delenv("MLFLOW_HTTP_REQUEST_TIMEOUT", raising=False)
+        monkeypatch.delenv("MLFLOW_HTTP_RESPECT_RETRY_AFTER_HEADER", raising=False)
+        http_request(host_only, "/my/endpoint", "GET")
+        mock_get_http_response_with_retries.assert_called_with(
+            mock.ANY,
+            mock.ANY,
+            7,
+            2,
+            1.0,
+            mock.ANY,
+            True,
+            headers=mock.ANY,
+            verify=mock.ANY,
+            timeout=120,
+            respect_retry_after_header=True,
+            retry_read_errors=True,
+            retry_on_retry_after=True,
+        )
+        mock_get_http_response_with_retries.reset_mock()
+        monkeypatch.setenv("MLFLOW_HTTP_REQUEST_MAX_RETRIES", "8")
+        monkeypatch.setenv("MLFLOW_HTTP_REQUEST_BACKOFF_FACTOR", "3")
+        monkeypatch.setenv("MLFLOW_HTTP_REQUEST_BACKOFF_JITTER", "1.0")
+        monkeypatch.setenv("MLFLOW_HTTP_REQUEST_TIMEOUT", "300")
+        monkeypatch.setenv("MLFLOW_HTTP_RESPECT_RETRY_AFTER_HEADER", "false")
+        http_request(host_only, "/my/endpoint", "GET")
+        mock_get_http_response_with_retries.assert_called_with(
+            mock.ANY,
+            mock.ANY,
+            8,
+            3,
+            1.0,
+            mock.ANY,
+            True,
+            headers=mock.ANY,
+            verify=mock.ANY,
+            timeout=300,
+            respect_retry_after_header=False,
+            retry_read_errors=True,
+            retry_on_retry_after=True,
+        )
+
+
+def test_http_request_explains_how_to_increase_timeout_in_error_message():
+    with mock.patch("requests.Session.request", side_effect=requests.exceptions.Timeout):
+        with pytest.raises(
+            MlflowException,
+            match=(
+                r"To increase the timeout, set the environment variable "
+                + re.escape(str(MLFLOW_HTTP_REQUEST_TIMEOUT))
+            ),
+        ):
+            http_request(MlflowHostCreds("http://my-host"), "/my/endpoint", "GET")
+
+
+def test_augmented_raise_for_status():
+    response = requests.Response()
+    response.status_code = 403
+    response._content = b"Token expired"
+
+    with mock.patch("requests.Session.request", return_value=response) as mock_request:
+        response = requests.get("https://github.com/mlflow/mlflow.git")
+        mock_request.assert_called_once()
+
+    with pytest.raises(requests.HTTPError, match="Token expired") as e:
+        augmented_raise_for_status(response)
+
+    assert e.value.response == response
+    assert e.value.request == response.request
+    assert response.text in str(e.value)
+
+
+def test_provide_redirect_kwarg():
+    with mock.patch("requests.Session.request") as mock_request:
+        mock_request.return_value.status_code = 302
+        mock_request.return_value.text = "mock response"
+
+        response = http_request(
+            MlflowHostCreds("http://my-host"),
+            "/my/endpoint",
+            "GET",
+            allow_redirects=False,
+        )
+
+        assert response.text == "mock response"
+        mock_request.assert_called_with(
+            "GET",
+            "http://my-host/my/endpoint",
+            allow_redirects=False,
+            headers=mock.ANY,
+            verify=mock.ANY,
+            timeout=120,
+        )
+
+
+def test_http_request_max_retries(monkeypatch):
+    monkeypatch.setenv("_MLFLOW_HTTP_REQUEST_MAX_RETRIES_LIMIT", "15")
+    host_creds = MlflowHostCreds("http://example.com")
+
+    with mock.patch("requests.Session.request") as mock_request:
+        # Value exceeding limit should raise
+        with pytest.raises(MlflowException, match="The configured max_retries"):
+            http_request(host_creds, "/endpoint", "GET", max_retries=16)
+        mock_request.assert_not_called()
+
+        # Value equal to limit should succeed (boundary case)
+        http_request(host_creds, "/endpoint", "GET", max_retries=15)
+        assert mock_request.call_count == 1
+
+        # Value below limit should succeed
+        http_request(host_creds, "/endpoint", "GET", max_retries=3)
+        assert mock_request.call_count == 2
+
+
+def test_http_request_backoff_factor(monkeypatch):
+    monkeypatch.setenv("_MLFLOW_HTTP_REQUEST_MAX_BACKOFF_FACTOR_LIMIT", "200")
+    host_creds = MlflowHostCreds("http://example.com")
+
+    with mock.patch("requests.Session.request") as mock_request:
+        # Value exceeding limit should raise
+        with pytest.raises(MlflowException, match="The configured backoff_factor"):
+            http_request(host_creds, "/endpoint", "GET", backoff_factor=250)
+        mock_request.assert_not_called()
+
+        # Value equal to limit should succeed (boundary case)
+        http_request(host_creds, "/endpoint", "GET", backoff_factor=200)
+        assert mock_request.call_count == 1
+
+        # Value below limit should succeed
+        http_request(host_creds, "/endpoint", "GET", backoff_factor=10)
+        assert mock_request.call_count == 2
+
+
+def test_http_request_negative_max_retries():
+    host_creds = MlflowHostCreds("http://example.com")
+
+    with mock.patch("requests.Session.request") as mock_request:
+        with pytest.raises(MlflowException, match="The max_retries value must be either"):
+            http_request(host_creds, "/endpoint", "GET", max_retries=-1)
+        mock_request.assert_not_called()
+
+
+def test_http_request_negative_backoff_factor():
+    host_creds = MlflowHostCreds("http://example.com")
+
+    with mock.patch("requests.Session.request") as mock_request:
+        with pytest.raises(MlflowException, match="The backoff_factor value must be"):
+            http_request(host_creds, "/endpoint", "GET", backoff_factor=-1)
+        mock_request.assert_not_called()
+
+
+def test_suppress_databricks_retry_after_secs_warnings():
+    host_creds = MlflowHostCreds("http://example.com", use_databricks_sdk=True)
+
+    def mock_do(*args, **kwargs):
+        warnings.warn(_DATABRICKS_SDK_RETRY_AFTER_SECS_DEPRECATION_WARNING)
+        return mock.MagicMock()
+
+    with (
+        warnings.catch_warnings(record=True) as recorded_warnings,
+        mock.patch("mlflow.utils.rest_utils.get_workspace_client") as mock_get_workspace_client,
+    ):
+        warnings.simplefilter("always")
+        mock_workspace_client = mock.MagicMock()
+        mock_workspace_client.api_client.do = mock_do
+        mock_get_workspace_client.return_value = mock_workspace_client
+        http_request(host_creds, "/endpoint", "GET")
+        mock_get_workspace_client.assert_called_once()
+        assert not any(
+            _DATABRICKS_SDK_RETRY_AFTER_SECS_DEPRECATION_WARNING in str(w.message)
+            for w in recorded_warnings
+        )
+
+
+@pytest.mark.parametrize(("kwargs", "expected_reads"), [({}, 1), ({"stream": True}, 0)])
+def test_databricks_sdk_response_is_consumed_unless_streaming(kwargs, expected_reads):
+    host_creds = MlflowHostCreds("http://example.com", use_databricks_sdk=True)
+    response = mock.MagicMock()
+    content = mock.PropertyMock(return_value=b"body")
+    type(response).content = content
+
+    with mock.patch("mlflow.utils.rest_utils.get_workspace_client") as get_client:
+        get_client.return_value.api_client.do.return_value = {
+            "contents": mock.MagicMock(_response=response)
+        }
+
+        assert http_request(host_creds, "/endpoint", "GET", **kwargs) is response
+
+    assert content.call_count == expected_reads
+
+
+def test_databricks_sdk_retry_on_transient_errors():
+    host_creds = MlflowHostCreds("http://example.com", use_databricks_sdk=True)
+
+    call_count = 0
+
+    def mock_do_failing_then_success(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count <= 2:  # Fail first 2 attempts
+            from databricks.sdk.errors import DatabricksError
+
+            from mlflow.protos.databricks_pb2 import ErrorCode
+
+            raise DatabricksError(
+                error_code=ErrorCode.Name(ErrorCode.INTERNAL_ERROR), message="Transient error"
+            )
+        # Success on 3rd attempt
+        response_mock = mock.MagicMock()
+        response_mock._response = mock.MagicMock()
+        return {"contents": response_mock}
+
+    with mock.patch("mlflow.utils.rest_utils.get_workspace_client") as mock_get_workspace_client:
+        mock_workspace_client = mock.MagicMock()
+        mock_workspace_client.api_client.do = mock_do_failing_then_success
+        mock_get_workspace_client.return_value = mock_workspace_client
+
+        # Use smaller retry timeout to make test run faster
+        response = http_request(
+            host_creds,
+            "/endpoint",
+            "GET",
+            retry_timeout_seconds=10,
+            backoff_factor=0.1,  # Very small backoff for faster test
+        )
+
+        assert call_count == 3  # Should retry 2 times, succeed on 3rd
+        assert response is not None
+
+
+def test_databricks_sdk_retry_max_retries_exceeded():
+    host_creds = MlflowHostCreds("http://example.com", use_databricks_sdk=True)
+
+    call_count = 0
+
+    def mock_do_always_fail(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        from databricks.sdk.errors import DatabricksError
+
+        raise DatabricksError(error_code="INTERNAL_ERROR", message="Always fails")
+
+    with (
+        mock.patch("mlflow.utils.rest_utils.get_workspace_client") as mock_get_workspace_client,
+        mock.patch("mlflow.utils.rest_utils._logger") as mock_logger,
+    ):
+        mock_workspace_client = mock.MagicMock()
+        mock_workspace_client.api_client.do = mock_do_always_fail
+        mock_get_workspace_client.return_value = mock_workspace_client
+
+        response = http_request(host_creds, "/endpoint", "GET", max_retries=3)
+
+        assert call_count == 4  # Initial call + 3 retries
+        assert response.status_code == 500  # Should return error response
+
+        # Check that max retries warning was logged
+        mock_logger.warning.assert_called()
+        warning_call = mock_logger.warning.call_args[0][0]
+        assert "Max retries (3) exceeded" in warning_call
+
+
+def test_databricks_sdk_retry_timeout_exceeded():
+    host_creds = MlflowHostCreds("http://example.com", use_databricks_sdk=True)
+
+    call_count = 0
+
+    def mock_do_always_fail(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+
+        time.sleep(0.1)  # Small delay to ensure timeout
+        from databricks.sdk.errors import DatabricksError
+
+        raise DatabricksError(error_code="INTERNAL_ERROR", message="Always fails")
+
+    with (
+        mock.patch("mlflow.utils.rest_utils.get_workspace_client") as mock_get_workspace_client,
+        mock.patch("mlflow.utils.rest_utils._logger") as mock_logger,
+    ):
+        mock_workspace_client = mock.MagicMock()
+        mock_workspace_client.api_client.do = mock_do_always_fail
+        mock_get_workspace_client.return_value = mock_workspace_client
+
+        response = http_request(
+            host_creds,
+            "/endpoint",
+            "GET",
+            retry_timeout_seconds=0.2,  # Very short timeout
+            max_retries=10,  # High retry limit that shouldn't be reached
+        )
+
+        assert call_count >= 1  # At least initial call
+        assert response.status_code == 500  # Should return error response
+
+        # Check that timeout warning was logged
+        mock_logger.warning.assert_called()
+        warning_call = mock_logger.warning.call_args[0][0]
+        assert "Retry timeout (0.2s) exceeded" in warning_call
+
+
+def test_databricks_sdk_retry_non_retryable_error():
+    host_creds = MlflowHostCreds("http://example.com", use_databricks_sdk=True)
+
+    call_count = 0
+
+    def mock_do_non_retryable_error(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        from databricks.sdk.errors import InvalidParameterValue
+
+        # Use an error code that maps to 400 (non-retryable)
+        raise InvalidParameterValue(error_code="INVALID_PARAMETER_VALUE", message="Bad request")
+
+    with mock.patch("mlflow.utils.rest_utils.get_workspace_client") as mock_get_workspace_client:
+        mock_workspace_client = mock.MagicMock()
+        mock_workspace_client.api_client.do = mock_do_non_retryable_error
+        mock_get_workspace_client.return_value = mock_workspace_client
+
+        response = http_request(host_creds, "/endpoint", "GET", max_retries=5)
+
+        assert call_count == 1  # Should not retry on non-retryable error
+        assert response.status_code == 400  # Should return 400 for INVALID_PARAMETER_VALUE
+
+
+def test_databricks_sdk_retry_backoff_calculation():
+    from databricks.sdk.errors import DatabricksError
+
+    from mlflow.utils.request_utils import _TRANSIENT_FAILURE_RESPONSE_CODES
+    from mlflow.utils.rest_utils import _retry_databricks_sdk_call_with_exponential_backoff
+
+    call_count = 0
+
+    def mock_failing_call():
+        nonlocal call_count
+        call_count += 1
+
+        raise DatabricksError(error_code="INTERNAL_ERROR", message="Mock error")
+
+    with mock.patch("mlflow.utils.rest_utils._time_sleep") as mock_sleep:
+        with pytest.raises(DatabricksError, match="Mock error"):
+            _retry_databricks_sdk_call_with_exponential_backoff(
+                call_func=mock_failing_call,
+                retry_codes=_TRANSIENT_FAILURE_RESPONSE_CODES,
+                retry_timeout_seconds=10,
+                backoff_factor=1,  # Use 1 for predictable calculation
+                backoff_jitter=0,  # No jitter for predictable calculation
+                max_retries=3,
+            )
+
+    # Verify sleep was called with correct intervals
+    # attempt 0 (1st retry): 0 seconds (immediate)
+    # attempt 1 (2nd retry): 1 * (2^1) = 2 seconds
+    # attempt 2 (3rd retry): 1 * (2^2) = 4 seconds
+    expected_sleep_times = [0, 2, 4]
+    actual_sleep_times = [call.args[0] for call in mock_sleep.call_args_list]
+    assert actual_sleep_times == expected_sleep_times
+    assert call_count == 4  # Initial + 3 retries
+
+
+@pytest.mark.skip
+def test_timeout_parameter_propagation_with_timeout():
+    with (
+        mock.patch("databricks.sdk.WorkspaceClient") as mock_workspace_client,
+        mock.patch("databricks.sdk.config.Config") as mock_config,
+    ):
+        # Test http_request with timeout via get_workspace_client directly
+        mock_workspace_client_instance = mock.MagicMock()
+        mock_workspace_client_instance.api_client.do.return_value = {"contents": mock.MagicMock()}
+        mock_workspace_client.return_value = mock_workspace_client_instance
+
+        get_workspace_client(
+            use_secret_scope_token=False,
+            host="http://my-host",
+            token=None,
+            databricks_auth_profile="my-profile",
+            retry_timeout_seconds=None,
+            timeout=180,
+        )
+
+        mock_config.assert_called_once_with(
+            profile="my-profile",
+            http_timeout_seconds=180,
+            retry_timeout_seconds=mock.ANY,
+        )
+
+
+@pytest.mark.skip
+def test_timeout_parameter_propagation_without_timeout():
+    with (
+        mock.patch("databricks.sdk.WorkspaceClient") as mock_workspace_client,
+        mock.patch("databricks.sdk.config.Config") as mock_config,
+    ):
+        # Test http_request without timeout via get_workspace_client directly
+        mock_workspace_client_instance = mock.MagicMock()
+        mock_workspace_client_instance.api_client.do.return_value = {"contents": mock.MagicMock()}
+        mock_workspace_client.return_value = mock_workspace_client_instance
+
+        get_workspace_client(
+            use_secret_scope_token=False,
+            host="http://my-host",
+            token=None,
+            databricks_auth_profile="my-profile",
+            retry_timeout_seconds=None,
+            timeout=None,
+        )
+
+        mock_config.assert_called_once_with(
+            profile="my-profile",
+            retry_timeout_seconds=mock.ANY,
+        )
+
+
+def test_deployment_client_timeout_propagation(monkeypatch):
+    with (
+        mock.patch("mlflow.utils.rest_utils.get_workspace_client") as mock_get_workspace_client,
+        mock.patch(
+            "mlflow.utils.databricks_utils.get_databricks_host_creds"
+        ) as mock_get_databricks_host_creds,
+        mock.patch(
+            "mlflow.deployments.databricks.get_databricks_host_creds"
+        ) as mock_deployment_host_creds,
+    ):
+        # Mock the host creds to use Databricks SDK
+        mock_host_creds = MlflowHostCreds("http://my-host", use_databricks_sdk=True)
+        mock_get_databricks_host_creds.return_value = mock_host_creds
+        mock_deployment_host_creds.return_value = mock_host_creds
+
+        # Mock workspace client and its response
+        mock_workspace_client_instance = mock.MagicMock()
+        mock_workspace_client_instance.api_client.do.return_value = {"contents": mock.MagicMock()}
+        mock_get_workspace_client.return_value = mock_workspace_client_instance
+
+        # Set the environment variable to a custom value using monkeypatch
+        monkeypatch.setenv("MLFLOW_DEPLOYMENT_PREDICT_TIMEOUT", "300")
+
+        # Create deployment client and call predict
+        client = DatabricksDeploymentClient("databricks")
+        client.predict(endpoint="test-endpoint", inputs={"test": "data"})
+
+        # Verify get_workspace_client was called with the deployment predict timeout
+        mock_get_workspace_client.assert_called_once_with(
+            False,  # use_secret_scope_token
+            "http://my-host",  # host
+            None,  # token
+            None,  # databricks_auth_profile
+            retry_timeout_seconds=600,
+            timeout=300,  # MLFLOW_DEPLOYMENT_PREDICT_TIMEOUT value
+        )
+
+
+def test_http_request_with_databricks_traffic_id(monkeypatch: pytest.MonkeyPatch):
+    response = mock.MagicMock()
+    response.status_code = 200
+
+    # Test with env var set
+    monkeypatch.setenv(_MLFLOW_DATABRICKS_TRAFFIC_ID.name, "test-traffic-id-12345")
+    with mock.patch("requests.Session.request", return_value=response) as mock_request:
+        http_request(MlflowHostCreds("http://my-host"), "/my/endpoint", "GET")
+        headers = mock_request.call_args.kwargs["headers"]
+        assert headers["x-databricks-traffic-id"] == "test-traffic-id-12345"
+
+    # Test without env var set
+    monkeypatch.delenv(_MLFLOW_DATABRICKS_TRAFFIC_ID.name)
+    with mock.patch("requests.Session.request", return_value=response) as mock_request:
+        http_request(MlflowHostCreds("http://my-host"), "/my/endpoint", "GET")
+        headers = mock_request.call_args.kwargs["headers"]
+        assert "x-databricks-traffic-id" not in headers
+
+
+def test_http_request_with_workspace_id():
+    response = mock.MagicMock()
+    response.status_code = 200
+
+    # With workspace_id set, header should be included
+    creds = MlflowHostCreds("http://my-host", workspace_id="6051921418418893")
+    with mock.patch("requests.Session.request", return_value=response) as mock_request:
+        http_request(creds, "/my/endpoint", "GET")
+        headers = mock_request.call_args.kwargs["headers"]
+        assert headers["x-databricks-org-id"] == "6051921418418893"
+
+    # Without workspace_id, header should not be present
+    creds = MlflowHostCreds("http://my-host")
+    with mock.patch("requests.Session.request", return_value=response) as mock_request:
+        http_request(creds, "/my/endpoint", "GET")
+        headers = mock_request.call_args.kwargs["headers"]
+        assert "x-databricks-org-id" not in headers
+
+
+def test_mlflow_host_creds_workspace_id_equality():
+    creds1 = MlflowHostCreds("http://my-host", workspace_id="123")
+    creds2 = MlflowHostCreds("http://my-host", workspace_id="123")
+    creds3 = MlflowHostCreds("http://my-host", workspace_id="456")
+    creds4 = MlflowHostCreds("http://my-host")
+
+    assert creds1 == creds2
+    assert creds1 != creds3
+    assert creds1 != creds4
+    assert hash(creds1) == hash(creds2)
+    assert hash(creds1) != hash(creds3)
+
+
+def test_oauth_error_when_sdk_enabled(monkeypatch):
+    # When MLFLOW_ENABLE_DB_SDK=true and the SDK failed to initialize, the OAuth error
+    # must acknowledge the env var is set and point at the preceding SDK warning, instead
+    # of telling the user to set an env var they have already set.
+    monkeypatch.setenv("MLFLOW_ENABLE_DB_SDK", "true")
+    creds = MlflowHostCreds(
+        "http://my-host",
+        client_id="some-id",
+        client_secret="some-secret",
+    )
+    with pytest.raises(MlflowException, match="SDK is enabled but failed to initialize") as exc:
+        http_request(creds, "/my/endpoint", "GET")
+    msg = str(exc.value)
+    assert "MLFLOW_ENABLE_DB_SDK is currently set to 'True'" in msg
+    assert "Failed to create databricks SDK workspace client" in msg
+
+
+def test_oauth_error_when_sdk_disabled(monkeypatch):
+    monkeypatch.setenv("MLFLOW_ENABLE_DB_SDK", "false")
+    creds = MlflowHostCreds(
+        "http://my-host",
+        client_id="some-id",
+        client_secret="some-secret",
+    )
+    with pytest.raises(MlflowException, match="Set 'MLFLOW_ENABLE_DB_SDK' to true") as exc:
+        http_request(creds, "/my/endpoint", "GET")
+    msg = str(exc.value)
+    assert "MLFLOW_ENABLE_DB_SDK is currently set to 'False'" in msg
+
+
+@pytest.mark.parametrize(
+    ("timeout", "retry_timeout_seconds", "should_warn"),
+    [
+        (300, 120, True),
+        (120, 600, False),
+        (300, 300, False),
+        (None, 120, False),
+        (300, None, False),
+        (None, None, False),
+    ],
+)
+def test_validate_deployment_timeout_config(timeout, retry_timeout_seconds, should_warn):
+    from mlflow.utils.rest_utils import validate_deployment_timeout_config
+
+    if should_warn:
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            validate_deployment_timeout_config(
+                timeout=timeout, retry_timeout_seconds=retry_timeout_seconds
+            )
+            assert len(w) == 1
+            warning_msg = str(w[0].message)
+            assert "MLFLOW_DEPLOYMENT_PREDICT_TOTAL_TIMEOUT" in warning_msg
+            assert f"({retry_timeout_seconds}s)" in warning_msg
+            assert f"({timeout}s)" in warning_msg
+    else:
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            validate_deployment_timeout_config(
+                timeout=timeout, retry_timeout_seconds=retry_timeout_seconds
+            )
+            assert len(w) == 0

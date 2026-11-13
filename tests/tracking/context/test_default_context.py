@@ -1,12 +1,10 @@
-import pytest
 from unittest import mock
 
+import pytest
+
 from mlflow.entities import SourceType
-from mlflow.utils.mlflow_tags import MLFLOW_USER, MLFLOW_SOURCE_NAME, MLFLOW_SOURCE_TYPE
 from mlflow.tracking.context.default_context import DefaultRunContext
-
-# pylint: disable=unused-argument
-
+from mlflow.utils.mlflow_tags import MLFLOW_SOURCE_NAME, MLFLOW_SOURCE_TYPE, MLFLOW_USER
 
 MOCK_SCRIPT_NAME = "/path/to/script.py"
 
@@ -29,5 +27,16 @@ def test_default_run_context_tags(patch_script_name):
         assert DefaultRunContext().tags() == {
             MLFLOW_USER: mock_user,
             MLFLOW_SOURCE_NAME: MOCK_SCRIPT_NAME,
+            MLFLOW_SOURCE_TYPE: SourceType.to_string(SourceType.LOCAL),
+        }
+
+
+@pytest.mark.parametrize("argv", [[""], []])
+def test_default_run_context_tags_console(argv):
+    mock_user = mock.Mock()
+    with mock.patch("sys.argv", argv), mock.patch("getpass.getuser", return_value=mock_user):
+        assert DefaultRunContext().tags() == {
+            MLFLOW_USER: mock_user,
+            MLFLOW_SOURCE_NAME: "<console>",
             MLFLOW_SOURCE_TYPE: SourceType.to_string(SourceType.LOCAL),
         }

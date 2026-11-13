@@ -7,16 +7,15 @@ Cross version testing is a testing strategy to ensure ML integrations in MLflow 
 
 ## Key files
 
-| File (relative path from the root)              | Role                                                           |
-| :---------------------------------------------- | :------------------------------------------------------------- |
-| [`mlflow/ml-package-versions.yml`][]            | Define which versions to test for each ML package.             |
-| [`dev/set_matrix.py`][]                         | Generate a test matrix from `ml-package-versions.yml`.         |
-| [`dev/update_ml_package_versions.py`][]         | Update `ml-package-versions.yml` when releasing a new version. |
-| [`.github/workflows/cross-version-tests.yml`][] | Define a Github Actions workflow for cross version testing.    |
+| File (relative path from the root)              | Role                                                                    |
+| :---------------------------------------------- | :---------------------------------------------------------------------- |
+| [`mlflow/ml-package-versions.yml`][]            | Define which versions to test for each ML package.                      |
+| [`flavors matrix`][flavors-cli]                 | Generate a test matrix from `ml-package-versions.yml` (`dev/flavors/`). |
+| [`flavors update`][flavors-cli]                 | Update `ml-package-versions.yml` when releasing a new version.          |
+| [`.github/workflows/cross-version-tests.yml`][] | Define a Github Actions workflow for cross version testing.             |
 
 [`mlflow/ml-package-versions.yml`]: ../../mlflow/ml-package-versions.yml
-[`dev/set_matrix.py`]: ../../dev/set_matrix.py
-[`dev/update_ml_package_versions.py`]: ../../dev/update_ml_package_versions.py
+[flavors-cli]: ../../dev/flavors/
 [`.github/workflows/cross-version-tests.yml`]: ./cross-version-tests.yml
 
 ## Configuration keys in `ml-package-versions.yml`
@@ -62,7 +61,7 @@ sklearn:
 
     # [Required] `run` specifies a set of commands to run tests.
     run: |
-      pytest tests/sklearn/test_sklearn_model_export.py --large
+      pytest tests/sklearn/test_sklearn_model_export.py
 ```
 
 ## How do we determine which versions to test?
@@ -112,10 +111,56 @@ the previous section:
 | 1.0.1         | ✅     | The latest micro version of `1.0`                  |
 | 1.1.dev       | ✅     | The version installed by `install_dev`             |
 
+## Why do we run tests against development versions?
+
+In cross-version testing, we run daily tests against both publicly available and pre-release
+development versions for all dependent libraries that are used by MLflow.
+This section explains why.
+
+### Without dev version test
+
+First, let's take a look at what would happen **without** dev version test.
+
+```
+  |
+  ├─ XGBoost merges a change on the master branch that breaks MLflow's XGBoost integration.
+  |
+  ├─ MLflow 1.20.0 release date
+  |
+  ├─ XGBoost 1.5.0 release date
+  ├─ ❌ We notice the change here and might need to make a patch release if it's critical.
+  |
+  v
+time
+```
+
+- We didn't notice the change until after XGBoost 1.5.0 was released.
+- MLflow 1.20.0 doesn't work with XGBoost 1.5.0.
+
+### With dev version test
+
+Then, let's take a look at what would happen **with** dev version test.
+
+```
+  |
+  ├─ XGBoost merges a change on the master branch that breaks MLflow's XGBoost integration.
+  ├─ ✅ Tests for the XGBoost integration fail -> We can notice the change and apply a fix for it.
+  |
+  ├─ MLflow 1.20.0 release date
+  |
+  ├─ XGBoost 1.5.0 release date
+  |
+  v
+time
+```
+
+- We can notice the change **before XGBoost 1.5.0 is released** and apply a fix for it **before releasing MLflow 1.20.0**.
+- MLflow 1.20.0 works with XGBoost 1.5.0.
+
 ## When do we run cross version tests?
 
 1. Daily at 7:00 UTC using a cron scheduler.
-   [README on the repository root](../../README.rst) has a badge ([![badge-img][]][badge-target]) that indicates the status of the most recent cron run.
+   [README on the repository root](../../README.md) has a badge ([![badge-img][]][badge-target]) that indicates the status of the most recent cron run.
 2. When a PR that affects the ML integrations is created. Note we only run tests relevant to
    the affected ML integrations. For example, a PR that affects files in `mlflow/sklearn` triggers
    cross version tests for `sklearn`.

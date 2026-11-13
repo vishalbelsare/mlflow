@@ -1,15 +1,27 @@
+import functools
+import io
+import json
 import os
-import pytest
+import pathlib
 import posixpath
+import stat
+from unittest import mock
 
-from mlflow.exceptions import MlflowException
+import pytest
+from opentelemetry.sdk.trace import ReadableSpan as OTelReadableSpan
+
+from mlflow.entities.span import Span, SpanAttributeKey
+from mlflow.entities.trace_data import TraceData
+from mlflow.exceptions import MlflowException, MlflowTraceDataCorrupted, MlflowTraceDataNotFound
 from mlflow.store.artifact.local_artifact_repo import LocalArtifactRepository
+from mlflow.tracing.otel.otel_archival import TRACE_ARCHIVAL_FILENAME, spans_to_traces_data_pb
+from mlflow.tracing.utils import build_otel_context
 from mlflow.utils.file_utils import TempDir
 
 
 @pytest.fixture
-def local_artifact_root(tmpdir):
-    return str(tmpdir)
+def local_artifact_root(tmp_path):
+    return str(tmp_path)
 
 
 @pytest.fixture
@@ -17,6 +29,118 @@ def local_artifact_repo(local_artifact_root):
     from mlflow.utils.file_utils import path_to_local_file_uri
 
     return LocalArtifactRepository(artifact_uri=path_to_local_file_uri(local_artifact_root))
+
+
+@pytest.mark.parametrize(
+    ("windows", "path"), [(True, "folder/model.txt"), (False, "folder./model:stream")]
+)
+def test_local_artifact_roundtrip_preserves_platform_names(
+    local_artifact_repo, tmp_path_factory, monkeypatch, windows, path
+):
+    if not windows and os.name == "nt":
+        pytest.skip("POSIX names require a POSIX filesystem.")
+    monkeypatch.setattr("mlflow.utils.uri.is_windows", lambda: windows)
+    monkeypatch.setattr("mlflow.store.artifact.local_artifact_repo.is_windows", lambda: windows)
+    source = tmp_path_factory.mktemp("source")
+    folder, name = path.rsplit("/", 1)
+    (source / name).write_text("x")
+    local_artifact_repo.log_artifacts(str(source), artifact_path=folder)
+    assert [f.path for f in local_artifact_repo.list_artifacts(folder)] == [path]
+    assert pathlib.Path(local_artifact_repo.download_artifacts(path)).read_text() == "x"
+    local_artifact_repo.delete_artifacts(folder)
+    assert local_artifact_repo.list_artifacts() == []
+
+
+@pytest.mark.parametrize("path", ["folder./file.txt", "folder /file.txt", "FOLDER~1/file.txt"])
+@pytest.mark.parametrize("operation", ["get_local_path", "_download_file"])
+def test_local_artifact_reads_reject_windows_aliases(
+    local_artifact_repo, monkeypatch, path, operation
+):
+    monkeypatch.setattr("mlflow.utils.uri.is_windows", lambda: True)
+    args = (path,) if operation == "get_local_path" else (path, "unused")
+    with pytest.raises(MlflowException, match="Invalid path"):
+        getattr(local_artifact_repo, operation)(*args)
+
+
+@pytest.mark.parametrize(
+    "path", ["folder.", "folder ", "FOLDER~1", "file:stream", "folder.\\file.txt"]
+)
+@pytest.mark.parametrize("operation", ["list_artifacts", "delete_artifacts"])
+def test_local_artifact_operations_reject_windows_aliases(
+    local_artifact_repo, monkeypatch, path, operation
+):
+    monkeypatch.setattr("mlflow.utils.uri.is_windows", lambda: True)
+    with pytest.raises(MlflowException, match="Invalid path"):
+        getattr(local_artifact_repo, operation)(path)
+
+
+@pytest.mark.parametrize("name", ["file:stream", "file.txt.", "FILE~1"])
+def test_local_artifact_rejected_upload_leaves_no_directory(
+    local_artifact_repo, local_artifact_root, monkeypatch, name
+):
+    monkeypatch.setattr("mlflow.utils.uri.is_windows", lambda: True)
+    with pytest.raises(MlflowException, match="Invalid path"):
+        local_artifact_repo.log_artifact_from_stream(io.BytesIO(b"x"), name, artifact_path="newdir")
+    assert not (pathlib.Path(local_artifact_root) / "newdir").exists()
+
+
+@pytest.mark.parametrize("artifact_path", ["folder.", "folder ", "FOLDER~1", "nested/folder."])
+@pytest.mark.parametrize("operation", ["log_artifact", "log_artifact_from_stream"])
+def test_local_artifact_upload_rejects_windows_alias_artifact_path(
+    local_artifact_repo,
+    local_artifact_root,
+    monkeypatch,
+    tmp_path_factory,
+    artifact_path,
+    operation,
+):
+    monkeypatch.setattr("mlflow.utils.uri.is_windows", lambda: True)
+    if operation == "log_artifact":
+        src_file = tmp_path_factory.mktemp("source") / "source.txt"
+        src_file.write_text("x")
+        call = functools.partial(
+            local_artifact_repo.log_artifact, str(src_file), artifact_path=artifact_path
+        )
+    else:
+        call = functools.partial(
+            local_artifact_repo.log_artifact_from_stream,
+            io.BytesIO(b"x"),
+            "source.txt",
+            artifact_path=artifact_path,
+        )
+    with pytest.raises(MlflowException, match="Invalid path"):
+        call()
+    assert list(pathlib.Path(local_artifact_root).iterdir()) == []
+
+
+def test_list_artifacts_hides_windows_alias_names(
+    local_artifact_repo, local_artifact_root, monkeypatch, caplog
+):
+    for name in ["model.txt", "model~1.txt"]:
+        with open(os.path.join(local_artifact_root, name), "w") as f:
+            f.write("x")
+    monkeypatch.setattr("mlflow.utils.uri.is_windows", lambda: True)
+    assert [f.path for f in local_artifact_repo.list_artifacts()] == ["model.txt"]
+    assert "model~1.txt" in caplog.text
+    assert "Skipping artifact" in caplog.text
+
+
+@pytest.mark.parametrize("is_directory", [False, True])
+def test_log_artifacts_rejects_nested_windows_alias_names(
+    local_artifact_repo, local_artifact_root, tmp_path_factory, monkeypatch, is_directory
+):
+    source = tmp_path_factory.mktemp("source") / "nested"
+    source.mkdir()
+    entry = source / "entry~1"
+    if is_directory:
+        entry.mkdir()
+    else:
+        entry.write_text("x")
+    monkeypatch.setattr("mlflow.utils.uri.is_windows", lambda: True)
+    monkeypatch.setattr("mlflow.store.artifact.local_artifact_repo.is_windows", lambda: True)
+    with pytest.raises(MlflowException, match="Invalid path"):
+        local_artifact_repo.log_artifacts(str(source.parent), artifact_path="newdir")
+    assert list(pathlib.Path(local_artifact_root).iterdir()) == []
 
 
 def test_list_artifacts(local_artifact_repo, local_artifact_root):
@@ -47,7 +171,25 @@ def test_log_artifacts(local_artifact_repo, local_artifact_root):
     artifact_dst_path = os.path.join(local_artifact_root, artifact_rel_path)
     assert os.path.exists(artifact_dst_path)
     assert artifact_dst_path != artifact_src_path
-    assert open(artifact_dst_path).read() == artifact_text
+    with open(artifact_dst_path) as f:
+        assert f.read() == artifact_text
+
+
+def test_log_artifact_preserves_source_file_mtime(local_artifact_repo, local_artifact_root):
+    artifact_rel_path = "test.txt"
+    artifact_text = "hello world!"
+    requested_mtime_ns = 1_700_000_000_123_456_789
+
+    with TempDir() as src_dir:
+        artifact_src_path = src_dir.path(artifact_rel_path)
+        with open(artifact_src_path, "w") as f:
+            f.write(artifact_text)
+        os.utime(artifact_src_path, ns=(requested_mtime_ns, requested_mtime_ns))
+        expected_mtime_ns = os.stat(artifact_src_path).st_mtime_ns
+        local_artifact_repo.log_artifact(artifact_src_path)
+
+    artifact_dst_path = os.path.join(local_artifact_root, artifact_rel_path)
+    assert os.stat(artifact_dst_path).st_mtime_ns == expected_mtime_ns
 
 
 @pytest.mark.parametrize("dst_path", [None, "dest"])
@@ -66,7 +208,8 @@ def test_download_artifacts(local_artifact_repo, dst_path):
         result = local_artifact_repo.download_artifacts(
             artifact_path=artifact_rel_path, dst_path=dst_path
         )
-        assert open(result).read() == artifact_text
+        with open(result) as f:
+            assert f.read() == artifact_text
         result = local_artifact_repo.download_artifacts(artifact_path="", dst_path=dst_path)
         empty_dir_dst_path = os.path.join(result, empty_dir_path)
         assert os.path.isdir(empty_dir_dst_path)
@@ -86,10 +229,28 @@ def test_download_artifacts_does_not_copy(local_artifact_repo):
             f.write(artifact_text)
         local_artifact_repo.log_artifact(artifact_src_path)
         dst_path = local_artifact_repo.download_artifacts(artifact_path=artifact_rel_path)
-        assert open(dst_path).read() == artifact_text
-        assert dst_path.startswith(
-            local_artifact_repo.artifact_dir
-        ), "downloaded artifact is not in local_artifact_repo.artifact_dir root"
+        with open(dst_path) as f:
+            assert f.read() == artifact_text
+        assert dst_path.startswith(local_artifact_repo.artifact_dir), (
+            "downloaded artifact is not in local_artifact_repo.artifact_dir root"
+        )
+
+
+def test_get_local_path_returns_absolute_path(local_artifact_repo):
+    artifact_rel_path = "test.txt"
+    artifact_text = "hello world!"
+    with TempDir(chdr=True) as local_dir:
+        artifact_src_path = local_dir.path(artifact_rel_path)
+        with open(artifact_src_path, "w") as f:
+            f.write(artifact_text)
+        local_artifact_repo.log_artifact(artifact_src_path)
+
+        local_path = local_artifact_repo.get_local_path(artifact_rel_path)
+
+    assert os.path.abspath(local_path) == local_path
+    assert local_path.startswith(local_artifact_repo.artifact_dir)
+    with open(local_path) as f:
+        assert f.read() == artifact_text
 
 
 def test_download_artifacts_returns_absolute_paths(local_artifact_repo):
@@ -130,20 +291,21 @@ def test_artifacts_are_logged_to_and_downloaded_from_repo_subdirectory_successfu
     subdir_contents = os.listdir(downloaded_subdir)
     assert len(subdir_contents) == 1
     assert artifact_rel_path in subdir_contents
-    assert open(os.path.join(downloaded_subdir, artifact_rel_path)).read() == artifact_text
+    with open(os.path.join(downloaded_subdir, artifact_rel_path)) as f:
+        assert f.read() == artifact_text
 
     downloaded_file = local_artifact_repo.download_artifacts(
         posixpath.join(repo_subdir_path, artifact_rel_path)
     )
-    assert open(downloaded_file).read() == artifact_text
+    with open(downloaded_file) as f:
+        assert f.read() == artifact_text
 
 
 def test_log_artifact_throws_exception_for_invalid_artifact_paths(local_artifact_repo):
     with TempDir() as local_dir:
         for bad_artifact_path in ["/", "//", "/tmp", "/bad_path", ".", "../terrible_path"]:
-            with pytest.raises(MlflowException) as exc_info:
+            with pytest.raises(MlflowException, match="Invalid artifact path"):
                 local_artifact_repo.log_artifact(local_dir.path(), bad_artifact_path)
-            assert "Invalid artifact path" in str(exc_info)
 
 
 def test_logging_directory_of_artifacts_produces_expected_repo_contents(local_artifact_repo):
@@ -157,9 +319,12 @@ def test_logging_directory_of_artifacts_produces_expected_repo_contents(local_ar
         with open(local_dir.path("subdir", "nested", "c.txt"), "w") as f:
             f.write("C")
         local_artifact_repo.log_artifacts(local_dir.path("subdir"))
-        assert open(local_artifact_repo.download_artifacts("a.txt")).read() == "A"
-        assert open(local_artifact_repo.download_artifacts("b.txt")).read() == "B"
-        assert open(local_artifact_repo.download_artifacts("nested/c.txt")).read() == "C"
+        with open(local_artifact_repo.download_artifacts("a.txt")) as f:
+            assert f.read() == "A"
+        with open(local_artifact_repo.download_artifacts("b.txt")) as f:
+            assert f.read() == "B"
+        with open(local_artifact_repo.download_artifacts("nested/c.txt")) as f:
+            assert f.read() == "C"
 
 
 def test_hidden_files_are_logged_correctly(local_artifact_repo):
@@ -168,10 +333,230 @@ def test_hidden_files_are_logged_correctly(local_artifact_repo):
         with open(hidden_file, "w") as f:
             f.write("42")
         local_artifact_repo.log_artifact(hidden_file)
-        assert open(local_artifact_repo.download_artifacts(".mystery")).read() == "42"
+        with open(local_artifact_repo.download_artifacts(".mystery")) as f:
+            assert f.read() == "42"
 
 
-def test_delete_artifacts(local_artifact_repo):
+def test_log_artifact_is_noop_when_source_matches_destination(
+    local_artifact_repo, local_artifact_root
+):
+    artifact_path = os.path.join(local_artifact_root, "test.txt")
+    with open(artifact_path, "w") as f:
+        f.write("artifact")
+
+    with mock.patch.object(local_artifact_repo, "_write_to_destination_path") as write_mock:
+        local_artifact_repo.log_artifact(artifact_path)
+
+    write_mock.assert_not_called()
+
+
+def test_log_artifact_rejects_internal_temp_file_prefix(local_artifact_repo):
+    with TempDir() as local_dir:
+        local_path = local_dir.path(".artifact.uploading.mock")
+        with open(local_path, "w") as f:
+            f.write("artifact")
+
+        with pytest.raises(MlflowException, match="Artifact names starting with"):
+            local_artifact_repo.log_artifact(local_path)
+
+
+def test_log_artifact_from_stream_writes_file_atomically(local_artifact_repo):
+    artifact_contents = b"hello world!"
+
+    local_artifact_repo.log_artifact_from_stream(
+        io.BytesIO(artifact_contents),
+        "test.txt",
+        artifact_path="nested",
+    )
+
+    artifact_dir = pathlib.Path(local_artifact_repo.artifact_dir) / "nested"
+    assert (artifact_dir / "test.txt").read_bytes() == artifact_contents
+    assert list(artifact_dir.glob(".artifact.uploading.*")) == []
+
+
+@pytest.mark.asyncio
+async def test_log_artifact_from_async_stream_writes_file_atomically(local_artifact_repo):
+    artifact_contents = b"hello world!"
+
+    async def chunk_stream():
+        yield artifact_contents[:5]
+        yield artifact_contents[5:]
+
+    await local_artifact_repo.log_artifact_from_async_stream(
+        chunk_stream(),
+        "test.txt",
+        artifact_path="nested",
+    )
+
+    artifact_dir = pathlib.Path(local_artifact_repo.artifact_dir) / "nested"
+    assert (artifact_dir / "test.txt").read_bytes() == artifact_contents
+    assert list(artifact_dir.glob(".artifact.uploading.*")) == []
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX-only permission semantics")
+def test_log_artifact_from_stream_preserves_default_file_mode(local_artifact_repo):
+    artifact_contents = b"hello world!"
+    artifact_dir = pathlib.Path(local_artifact_repo.artifact_dir) / "nested"
+    artifact_dir.mkdir()
+
+    reference_path = artifact_dir / "reference.txt"
+    with open(reference_path, "wb"):
+        pass
+    expected_mode = stat.S_IMODE(reference_path.stat().st_mode)
+    reference_path.unlink()
+
+    local_artifact_repo.log_artifact_from_stream(
+        io.BytesIO(artifact_contents),
+        "test.txt",
+        artifact_path="nested",
+    )
+
+    final_path = artifact_dir / "test.txt"
+    assert stat.S_IMODE(final_path.stat().st_mode) == expected_mode
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.name == "nt", reason="POSIX-only permission semantics")
+async def test_log_artifact_from_async_stream_preserves_default_file_mode(
+    local_artifact_repo,
+):
+    artifact_contents = b"hello world!"
+    artifact_dir = pathlib.Path(local_artifact_repo.artifact_dir) / "nested"
+    artifact_dir.mkdir()
+
+    reference_path = artifact_dir / "reference.txt"
+    with open(reference_path, "wb"):
+        pass
+    expected_mode = stat.S_IMODE(reference_path.stat().st_mode)
+    reference_path.unlink()
+
+    async def chunk_stream():
+        yield artifact_contents
+
+    await local_artifact_repo.log_artifact_from_async_stream(
+        chunk_stream(),
+        "test.txt",
+        artifact_path="nested",
+    )
+
+    final_path = artifact_dir / "test.txt"
+    assert stat.S_IMODE(final_path.stat().st_mode) == expected_mode
+
+
+def test_log_artifact_from_stream_cleans_up_temp_file_on_failure(local_artifact_repo):
+    artifact_dir = pathlib.Path(local_artifact_repo.artifact_dir) / "nested"
+    artifact_dir.mkdir()
+    final_path = artifact_dir / "test.txt"
+    final_path.write_bytes(b"existing-content")
+
+    class FailingStream:
+        def __init__(self):
+            self._chunks = iter([b"new-content", RuntimeError("stream failed")])
+
+        def read(self, _size: int) -> bytes:
+            chunk = next(self._chunks, b"")
+            if isinstance(chunk, Exception):
+                raise chunk
+            return chunk
+
+    with pytest.raises(RuntimeError, match="stream failed"):
+        local_artifact_repo.log_artifact_from_stream(
+            FailingStream(),
+            "test.txt",
+            artifact_path="nested",
+        )
+
+    assert final_path.read_bytes() == b"existing-content"
+    assert list(artifact_dir.glob(".artifact.uploading.*")) == []
+
+
+@pytest.mark.asyncio
+async def test_log_artifact_from_async_stream_cleans_up_temp_file_on_failure(
+    local_artifact_repo,
+):
+    artifact_dir = pathlib.Path(local_artifact_repo.artifact_dir) / "nested"
+    artifact_dir.mkdir()
+    final_path = artifact_dir / "test.txt"
+    final_path.write_bytes(b"existing-content")
+
+    async def failing_chunk_stream():
+        yield b"new-content"
+        raise RuntimeError("stream failed")
+
+    with pytest.raises(RuntimeError, match="stream failed"):
+        await local_artifact_repo.log_artifact_from_async_stream(
+            failing_chunk_stream(),
+            "test.txt",
+            artifact_path="nested",
+        )
+
+    assert final_path.read_bytes() == b"existing-content"
+    assert list(artifact_dir.glob(".artifact.uploading.*")) == []
+
+
+def test_log_artifact_from_stream_closes_fd_when_fdopen_fails(local_artifact_repo):
+    artifact_dir = pathlib.Path(local_artifact_repo.artifact_dir) / "nested"
+    artifact_dir.mkdir()
+    temp_artifact_path = artifact_dir / ".artifact.uploading.mock"
+    temp_artifact_path.touch()
+
+    with (
+        mock.patch(
+            "mlflow.store.artifact.local_artifact_repo.tempfile.mkstemp",
+            return_value=(123, str(temp_artifact_path)),
+        ),
+        mock.patch(
+            "mlflow.store.artifact.local_artifact_repo.os.fdopen",
+            side_effect=OSError("fdopen failed"),
+        ),
+        mock.patch("mlflow.store.artifact.local_artifact_repo.os.close") as close_mock,
+        mock.patch("mlflow.store.artifact.local_artifact_repo.os.remove") as remove_mock,
+    ):
+        with pytest.raises(OSError, match="fdopen failed"):
+            local_artifact_repo.log_artifact_from_stream(
+                io.BytesIO(b"hello world!"),
+                "test.txt",
+                artifact_path="nested",
+            )
+
+    close_mock.assert_called_once_with(123)
+    remove_mock.assert_called_once_with(str(temp_artifact_path))
+
+
+@pytest.mark.asyncio
+async def test_log_artifact_from_async_stream_closes_fd_when_fdopen_fails(local_artifact_repo):
+    artifact_dir = pathlib.Path(local_artifact_repo.artifact_dir) / "nested"
+    artifact_dir.mkdir()
+    temp_artifact_path = artifact_dir / ".artifact.uploading.mock"
+    temp_artifact_path.touch()
+
+    async def chunk_stream():
+        yield b"hello world!"
+
+    with (
+        mock.patch(
+            "mlflow.store.artifact.local_artifact_repo.tempfile.mkstemp",
+            return_value=(123, str(temp_artifact_path)),
+        ),
+        mock.patch(
+            "mlflow.store.artifact.local_artifact_repo.os.fdopen",
+            side_effect=OSError("fdopen failed"),
+        ),
+        mock.patch("mlflow.store.artifact.local_artifact_repo.os.close") as close_mock,
+        mock.patch("mlflow.store.artifact.local_artifact_repo.os.remove") as remove_mock,
+    ):
+        with pytest.raises(OSError, match="fdopen failed"):
+            await local_artifact_repo.log_artifact_from_async_stream(
+                chunk_stream(),
+                "test.txt",
+                artifact_path="nested",
+            )
+
+    close_mock.assert_called_once_with(123)
+    remove_mock.assert_called_once_with(str(temp_artifact_path))
+
+
+def test_delete_artifacts_folder(local_artifact_repo):
     with TempDir() as local_dir:
         os.mkdir(local_dir.path("subdir"))
         os.mkdir(local_dir.path("subdir", "nested"))
@@ -187,3 +572,224 @@ def test_delete_artifacts(local_artifact_repo):
         assert os.path.exists(os.path.join(local_artifact_repo._artifact_dir, "b.txt"))
         local_artifact_repo.delete_artifacts()
         assert not os.path.exists(os.path.join(local_artifact_repo._artifact_dir))
+
+
+def test_delete_artifacts_files(local_artifact_repo, tmp_path):
+    subdir = tmp_path / "subdir"
+    nested = subdir / "nested"
+    subdir.mkdir()
+    nested.mkdir()
+
+    (subdir / "a.txt").write_text("A")
+    (subdir / "b.txt").write_text("B")
+    (nested / "c.txt").write_text("C")
+
+    local_artifact_repo.log_artifacts(str(subdir))
+    artifact_dir = pathlib.Path(local_artifact_repo._artifact_dir)
+    assert (artifact_dir / "nested").exists()
+    assert (artifact_dir / "a.txt").exists()
+    assert (artifact_dir / "b.txt").exists()
+
+    local_artifact_repo.delete_artifacts(artifact_path="nested/c.txt")
+    local_artifact_repo.delete_artifacts(artifact_path="b.txt")
+
+    assert not (artifact_dir / "nested" / "c.txt").exists()
+    assert not (artifact_dir / "b.txt").exists()
+    assert (artifact_dir / "a.txt").exists()
+
+
+def test_delete_artifacts_with_nonexistent_path_succeeds(local_artifact_repo):
+    local_artifact_repo.delete_artifacts("nonexistent")
+
+
+def test_download_artifacts_invalid_remote_file_path(local_artifact_repo):
+    with pytest.raises(MlflowException, match="Invalid path"):
+        local_artifact_repo.download_artifacts("/absolute/path/to/file")
+
+
+def test_trace_data(local_artifact_repo):
+    with pytest.raises(MlflowTraceDataNotFound, match=r"Trace data not found for path="):
+        local_artifact_repo.download_trace_data()
+    local_artifact_repo.upload_trace_data("invalid data")
+    with pytest.raises(MlflowTraceDataCorrupted, match=r"Trace data is corrupted for path="):
+        local_artifact_repo.download_trace_data()
+
+    mock_trace_data = {"spans": [], "request": {"test": 1}, "response": {"test": 2}}
+    local_artifact_repo.upload_trace_data(json.dumps(mock_trace_data))
+    assert local_artifact_repo.download_trace_data() == mock_trace_data
+
+
+def _make_span() -> Span:
+    otel_span = OTelReadableSpan(
+        name="test-span",
+        context=build_otel_context(1, 10),
+        start_time=1_000_000,
+        end_time=2_000_000,
+        attributes={
+            SpanAttributeKey.REQUEST_ID: json.dumps("tr-abc123"),
+            SpanAttributeKey.INPUTS: json.dumps({"q": "hello"}),
+            SpanAttributeKey.OUTPUTS: json.dumps({"a": "world"}),
+            SpanAttributeKey.SPAN_TYPE: json.dumps("UNKNOWN"),
+        },
+    )
+    return Span(otel_span)
+
+
+def test_archived_trace_data_errors(local_artifact_repo):
+    assert (
+        local_artifact_repo.download_archived_trace_data().to_dict()
+        == TraceData(spans=[]).to_dict()
+    )
+
+    trace_pb_path = pathlib.Path(local_artifact_repo.artifact_dir, TRACE_ARCHIVAL_FILENAME)
+    trace_pb_path.write_bytes(b"")
+    with pytest.raises(MlflowTraceDataCorrupted, match=r"Trace data is corrupted for path="):
+        local_artifact_repo.download_archived_trace_data()
+
+
+def test_upload_archived_trace_data_rejects_empty_spans(local_artifact_repo):
+    with pytest.raises(MlflowException, match="at least one span"):
+        local_artifact_repo.upload_archived_trace_data(TraceData(spans=[]))
+
+
+def test_trace_data_artifact_repo(local_artifact_repo):
+    trace_data = TraceData(spans=[_make_span()]).to_dict()
+
+    local_artifact_repo.upload_trace_data(json.dumps(trace_data))
+
+    restored = local_artifact_repo.download_trace_data()
+    assert restored == trace_data
+
+
+def test_upload_archived_trace_data_rejects_non_trace_data(local_artifact_repo):
+    with pytest.raises(MlflowException, match="Archived trace data must be a TraceData object."):
+        local_artifact_repo.upload_archived_trace_data("not-trace-data")
+
+
+def test_archived_trace_data_with_trace_data_object(local_artifact_repo):
+    trace_data = TraceData(spans=[_make_span()])
+
+    local_artifact_repo.upload_archived_trace_data(trace_data)
+
+    restored = local_artifact_repo.download_archived_trace_data()
+    assert restored.to_dict() == trace_data.to_dict()
+
+
+def test_upload_archived_trace_data_bytes(local_artifact_repo):
+    trace_data = TraceData(spans=[_make_span()])
+
+    local_artifact_repo.upload_archived_trace_data_bytes(spans_to_traces_data_pb(trace_data.spans))
+
+    restored = local_artifact_repo.download_archived_trace_data()
+    assert restored.to_dict() == trace_data.to_dict()
+
+
+@pytest.fixture
+def external_secret_dir(tmp_path):
+    secret_dir = tmp_path.parent / "secrets_outside"
+    secret_dir.mkdir(exist_ok=True)
+    secret_file = secret_dir / "secret.txt"
+    secret_file.touch()
+    return secret_dir
+
+
+def _execute_operation(local_artifact_repo, operation, access_path, tmp_path):
+    if operation == "download_artifacts":
+        local_artifact_repo.download_artifacts(access_path)
+    elif operation == "get_local_path":
+        local_artifact_repo.get_local_path(access_path)
+    elif operation == "list_artifacts":
+        local_artifact_repo.list_artifacts(access_path)
+    elif operation == "_download_file":
+        dst_path = tmp_path / "downloaded.txt"
+        local_artifact_repo._download_file(access_path, str(dst_path))
+
+
+@pytest.mark.parametrize(
+    ("symlink_name", "access_path", "operation"),
+    [
+        ("leak", "leak/secret.txt", "download_artifacts"),
+        ("leak", "leak/secret.txt", "get_local_path"),
+        ("leak", "leak", "list_artifacts"),
+        ("leak", "leak/secret.txt", "_download_file"),
+        ("parent_link", "parent_link/secret.txt", "download_artifacts"),
+    ],
+)
+def test_symlink_path_traversal_blocked(
+    local_artifact_repo, external_secret_dir, tmp_path, symlink_name, access_path, operation
+):
+    artifact_dir = pathlib.Path(local_artifact_repo.artifact_dir)
+    symlink_path = artifact_dir / symlink_name
+    symlink_path.symlink_to(external_secret_dir)
+
+    with pytest.raises(MlflowException, match="resolved path is outside the artifact directory"):
+        _execute_operation(local_artifact_repo, operation, access_path, tmp_path)
+
+
+def test_nested_symlink_traversal_blocked(local_artifact_repo, external_secret_dir):
+    artifact_dir = pathlib.Path(local_artifact_repo.artifact_dir)
+    nested_dir = artifact_dir / "nested"
+    nested_dir.mkdir()
+    symlink_path = nested_dir / "leak"
+    symlink_path.symlink_to(external_secret_dir)
+
+    with pytest.raises(MlflowException, match="resolved path is outside the artifact directory"):
+        local_artifact_repo.download_artifacts("nested/leak/secret.txt")
+
+
+@pytest.mark.parametrize(
+    ("setup_type", "access_path", "expected_content"),
+    [
+        ("file", "artifact_link.txt", "LEGITIMATE_CONTENT"),
+        ("subdir", "link_to_subdir/file.txt", "CONTENT"),
+    ],
+)
+def test_symlink_within_artifact_dir_allowed(
+    local_artifact_repo, setup_type, access_path, expected_content
+):
+    artifact_dir = pathlib.Path(local_artifact_repo.artifact_dir)
+
+    if setup_type == "file":
+        real_file = artifact_dir / "real_artifact.txt"
+        real_file.write_text(expected_content)
+        symlink_path = artifact_dir / "artifact_link.txt"
+        symlink_path.symlink_to(real_file)
+    elif setup_type == "subdir":
+        subdir = artifact_dir / "subdir"
+        subdir.mkdir()
+        real_file = subdir / "file.txt"
+        real_file.write_text(expected_content)
+        symlink_path = artifact_dir / "link_to_subdir"
+        symlink_path.symlink_to(subdir)
+
+    result = local_artifact_repo.download_artifacts(access_path)
+    with open(result) as f:
+        assert f.read() == expected_content
+
+    if setup_type == "subdir":
+        artifacts = local_artifact_repo.list_artifacts("link_to_subdir")
+        assert len(artifacts) == 1
+        assert artifacts[0].path == "link_to_subdir/file.txt"
+
+
+def test_list_artifacts_on_file_returns_empty(local_artifact_repo, local_artifact_root):
+    artifact_path = os.path.join(local_artifact_root, "file.txt")
+    with open(artifact_path, "w") as f:
+        f.write("data")
+    assert local_artifact_repo.list_artifacts("file.txt") == []
+
+
+@pytest.mark.parametrize("dst_path_provided", [True, False])
+def test_download_artifacts_nonexistent_raises_resource_does_not_exist(
+    local_artifact_repo, tmp_path, dst_path_provided
+):
+    dst = str(tmp_path) if dst_path_provided else None
+    with pytest.raises(MlflowException, match="No such artifact") as exc_info:
+        local_artifact_repo.download_artifacts("nonexistent.txt", dst_path=dst)
+    assert exc_info.value.error_code == "RESOURCE_DOES_NOT_EXIST"
+
+
+def test_get_local_path_nonexistent_raises_resource_does_not_exist(local_artifact_repo):
+    with pytest.raises(MlflowException, match="No such artifact") as exc_info:
+        local_artifact_repo.get_local_path("nonexistent.txt")
+    assert exc_info.value.error_code == "RESOURCE_DOES_NOT_EXIST"

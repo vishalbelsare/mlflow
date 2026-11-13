@@ -1,7 +1,7 @@
 Python Package Anti-Tampering with MLflow
 -----------------------------------------
 This directory contains an MLflow project showing how to harden the ML supply chain, and in particular
-how to protect against Python package tampering by enforcing 
+how to protect against Python package tampering by enforcing
 `hash checks <https://pip.pypa.io/en/latest/cli/pip_install/#hash-checking-mode>`_ on packages.
 
 Running this Example
@@ -27,15 +27,12 @@ Inference is performed by sending JSON POST requests to http://localhost:5000/in
 
 .. code-block:: bash
 
-  curl -X POST -d "{\"data\":[[0.0199132142,0.0506801187,0.1048086895,0.0700725447,-0.0359677813,-0.0266789028,-0.0249926566,-0.002592262,0.0037117382,0.0403433716]]}" -H "Content-Type: application/json; format=pandas-split" http://localhost:5000/invocations
-  
+  curl -X POST -d "{\"dataframe_split\": {\"data\":[[0.0199132142,0.0506801187,0.1048086895,0.0700725447,-0.0359677813,-0.0266789028,-0.0249926566,-0.002592262,0.0037117382,0.0403433716]]}}" -H "Content-Type: application/json" http://localhost:5000/invocations
+
 Which returns ``[235.11371081266924]``.
 
 Structure of this MLflow Project
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-PIP `hash-checking mode <https://pip.pypa.io/en/latest/cli/pip_install/#hash-checking-mode>`_ is enforced by
-setting ``--require-hashes`` in the conda environment ``conda.yaml``:
 
 .. code-block:: yaml
 
@@ -66,10 +63,11 @@ That same conda environment is referenced when logging the model in ``train.py``
 
   mlflow.sklearn.log_model(
       model,
-      artifact_path = "model",
-      signature = mlflow.models.infer_signature(X_train[:10], y_train[:10]),
-      input_example = X_train[:10],
-      conda_env = "conda.yaml")
+      name="model",
+      signature=mlflow.models.infer_signature(X_train[:10], y_train[:10]),
+      input_example=X_train[:10],
+      conda_env="conda.yaml",
+  )
 
 The package requirements are managed in ``requirements.in``:
 

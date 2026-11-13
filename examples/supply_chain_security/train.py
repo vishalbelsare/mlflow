@@ -1,5 +1,6 @@
-import mlflow
 import sklearn
+
+import mlflow
 
 # Use explicit model logging to control the conda environment and pip requirements
 mlflow.sklearn.autolog(log_models=False)
@@ -19,8 +20,7 @@ with mlflow.start_run() as run:
 
     mlflow.sklearn.log_model(
         model,
-        artifact_path="model",
+        name="model",
         signature=mlflow.models.infer_signature(X_train[:10], y_train[:10]),
         input_example=X_train[:10],
-        conda_env="conda.yaml",
     )

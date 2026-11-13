@@ -1,0 +1,124 @@
+import { Button, ChevronDownIcon, ChevronRightIcon, Typography, useDesignSystemTheme } from '@databricks/design-system';
+import { useVisibleIssueReferenceAssessments } from '../hooks/useVisibleIssueReferences';
+import type { IssueReferenceAssessment } from '../ModelTrace.types';
+import { useState } from 'react';
+import { FormattedMessage } from 'react-intl';
+import { isEmpty } from 'lodash';
+import { GenAIMarkdownRenderer } from '../../genai-markdown-renderer/GenAIMarkdownRenderer';
+
+const IssueItem = ({ issue }: { issue: IssueReferenceAssessment }) => {
+  const { theme } = useDesignSystemTheme();
+  const [expanded, setExpanded] = useState(false);
+  const issueName = issue.issue.issue_name || issue.assessment_name;
+
+  return (
+    <div
+      css={{
+        display: 'flex',
+        flexDirection: 'column',
+        marginBottom: theme.spacing.sm,
+        border: `1px solid ${theme.colors.border}`,
+        borderRadius: theme.borders.borderRadiusMd,
+        padding: theme.spacing.sm + theme.spacing.xs,
+        paddingTop: theme.spacing.sm,
+        gap: theme.spacing.sm,
+      }}
+    >
+      <div css={{ display: 'flex', alignItems: 'center', gap: theme.spacing.xs }}>
+        {issue.rationale && (
+          <Button
+            componentId="shared.model-trace-explorer.toggle-issue-expanded"
+            css={{ flexShrink: 0 }}
+            size="small"
+            icon={expanded ? <ChevronDownIcon /> : <ChevronRightIcon />}
+            onClick={() => setExpanded(!expanded)}
+          />
+        )}
+        <Typography.Text
+          bold
+          css={{
+            overflow: 'hidden',
+            textOverflow: 'ellipsis',
+            whiteSpace: 'nowrap',
+          }}
+          title={issueName}
+        >
+          {issueName}
+        </Typography.Text>
+      </div>
+      {expanded && issue.rationale && (
+        <div
+          css={{
+            display: 'flex',
+            flexDirection: 'column',
+            gap: theme.spacing.xs,
+            paddingLeft: theme.spacing.lg / 2,
+            marginLeft: theme.spacing.lg / 2,
+            borderLeft: `1px solid ${theme.colors.border}`,
+          }}
+        >
+          <Typography.Text size="sm" color="secondary">
+            <FormattedMessage defaultMessage="Rationale" description="Label for the rationale of an issue assessment" />
+          </Typography.Text>
+          <div css={{ '& > div:last-of-type': { marginBottom: 0 } }}>
+            <GenAIMarkdownRenderer compact>{issue.rationale}</GenAIMarkdownRenderer>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+export const AssessmentsPaneIssuesSection = ({
+  issues,
+  selectedIssueId,
+}: {
+  issues: IssueReferenceAssessment[];
+  selectedIssueId?: string;
+}) => {
+  // Deduped and status-filtered here, where the count below is rendered: every detection run leaves
+  // its own reference on a trace it flags, so taking them as they come showed a card per run and an
+  // "Issues (n)" that climbed with each rerun, counting issues already dismissed as not an issue.
+  // Neither pass is memoized: the hook returns a fresh array each render, so a memo keyed on it
+  // would never hit, and both run over the handful of issues one trace carries.
+  const sortedIssues = useVisibleIssueReferenceAssessments(issues).toSorted((left, right) =>
+    left.assessment_name.localeCompare(right.assessment_name),
+  );
+  // issue_id is stored as the assessment name.
+  const filteredIssues = selectedIssueId
+    ? sortedIssues.filter((issue) => issue.assessment_name === selectedIssueId)
+    : sortedIssues;
+
+  const { theme } = useDesignSystemTheme();
+
+  if (isEmpty(filteredIssues)) {
+    return null;
+  }
+
+  return (
+    <>
+      <div
+        css={{
+          display: 'flex',
+          justifyContent: 'space-between',
+          alignItems: 'center',
+          height: theme.spacing.lg,
+          flexShrink: 0,
+        }}
+      >
+        <Typography.Text bold>
+          <FormattedMessage
+            defaultMessage="Issues"
+            description="Label for the issues section in the assessments pane"
+          />{' '}
+          ({filteredIssues.length})
+        </Typography.Text>
+      </div>
+      <div css={{ display: 'flex', flexDirection: 'column' }}>
+        {filteredIssues.map((issue) => (
+          <IssueItem issue={issue} key={issue.assessment_id} />
+        ))}
+      </div>
+    </>
+  );
+};

@@ -1,13 +1,20 @@
+from typing import Any, NamedTuple
+
 import numpy as np
 import pandas as pd
 import statsmodels.api as sm
-from collections import namedtuple
-from statsmodels.tsa.arima_process import arma_generate_sample
-from statsmodels.tsa.arima.model import ARIMA
 from scipy.linalg import toeplitz
+from statsmodels.tsa.arima.model import ARIMA
+from statsmodels.tsa.arima_process import arma_generate_sample
+
+from mlflow.models import ModelSignature
+from mlflow.types.schema import Schema, TensorSpec
 
 
-ModelWithResults = namedtuple("ModelWithResults", ["model", "alg", "inference_dataframe"])
+class ModelWithResults(NamedTuple):
+    model: Any
+    alg: Any
+    inference_dataframe: Any
 
 
 """
@@ -21,7 +28,7 @@ def ols_model(**kwargs):
     np.random.seed(9876789)
     nsamples = 100
     x = np.linspace(0, 10, 100)
-    X = np.column_stack((x, x ** 2))
+    X = np.column_stack((x, x**2))
     beta = np.array([1, 0.1, 10])
     e = np.random.normal(size=nsamples)
     X = sm.add_constant(X)
@@ -31,6 +38,13 @@ def ols_model(**kwargs):
     model = ols.fit(**kwargs)
 
     return ModelWithResults(model=model, alg=ols, inference_dataframe=X)
+
+
+def ols_model_signature():
+    return ModelSignature(
+        inputs=Schema([TensorSpec(np.dtype("float64"), (-1, 3))]),
+        outputs=Schema([TensorSpec(np.dtype("float64"), (-1,))]),
+    )
 
 
 def failing_logit_model():
@@ -65,7 +79,7 @@ def gls_model():
     res_fit = sm.OLS(ols_resid[1:], ols_resid[:-1]).fit()
     rho = res_fit.params
     order = toeplitz(np.arange(16))
-    sigma = rho ** order
+    sigma = rho**order
     gls = sm.GLS(data.endog, data.exog, sigma=sigma)
     model = gls.fit()
 
@@ -97,13 +111,11 @@ def wls_model():
 def recursivels_model():
     # Recursive Least Squares
     dta = sm.datasets.copper.load_pandas().data
-    dta.index = pd.date_range("1951-01-01", "1975-01-01", freq="AS")
+    dta.index = pd.date_range("1951-01-01", "1975-01-01", freq=pd.offsets.YearBegin())
     endog = dta.WORLDCONSUMPTION
 
     # To the regressors in the dataset, we add a column of ones for an intercept
-    exog = sm.add_constant(
-        dta[["COPPERPRICE", "INCOMEINDEX", "ALUMPRICE", "INVENTORYINDEX"]]  # pylint: disable=E1136
-    )
+    exog = sm.add_constant(dta[["COPPERPRICE", "INCOMEINDEX", "ALUMPRICE", "INVENTORYINDEX"]])
     rls = sm.RecursiveLS(endog, exog)
     model = rls.fit()
 
@@ -152,9 +164,9 @@ def gee_model():
     xmat = np.random.normal(size=(n, p))
 
     # Construct labels showing which group each observation belongs to at each level.
-    groups_ix = np.kron(np.arange(n // group_size), np.ones(group_size)).astype(np.int)
-    level1_ix = np.kron(np.arange(n // level1_size), np.ones(level1_size)).astype(np.int)
-    level2_ix = np.kron(np.arange(n // level2_size), np.ones(level2_size)).astype(np.int)
+    groups_ix = np.kron(np.arange(n // group_size), np.ones(group_size)).astype(int)
+    level1_ix = np.kron(np.arange(n // level1_size), np.ones(level1_size)).astype(int)
+    level2_ix = np.kron(np.arange(n // level2_size), np.ones(level2_size)).astype(int)
 
     # Simulate the random effects.
     groups_re = np.sqrt(groups_var) * np.random.normal(size=n // group_size)
@@ -166,7 +178,7 @@ def gee_model():
     y += np.sqrt(resid_var) * np.random.normal(size=n)
 
     # Put everything into a dataframe.
-    df = pd.DataFrame(xmat, columns=["x%d" % j for j in range(p)])
+    df = pd.DataFrame(xmat, columns=[f"x{j}" for j in range(p)])
     df["y"] = y + xmat[:, 0] - xmat[:, 3]
     df["groups_ix"] = groups_ix
     df["level1_ix"] = level1_ix
@@ -215,7 +227,7 @@ def arma_model():
     maparams = np.array([1, 0.65, 0.35])
     nobs = 250
     y = arma_generate_sample(arparams, maparams, nobs)
-    dates = pd.date_range("1980-1-1", freq="M", periods=nobs)
+    dates = pd.date_range("1980-1-1", freq=pd.offsets.MonthEnd(), periods=nobs)
     y = pd.Series(y, index=dates)
 
     arima = ARIMA(y, order=(2, 0, 2), trend="n")

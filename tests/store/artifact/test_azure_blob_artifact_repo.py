@@ -1,21 +1,31 @@
+import base64
+import json
 import os
 import posixpath
-import pytest
+import urllib.parse
 from unittest import mock
 
-from azure.storage.blob import BlobServiceClient, BlobPrefix, BlobProperties
+import pytest
+from azure.core.credentials import AzureSasCredential
+from azure.core.exceptions import HttpResponseError, ResourceNotFoundError
+from azure.storage.blob import BlobPrefix, BlobProperties, BlobServiceClient
 
-from mlflow.exceptions import MlflowException
+from mlflow.entities.multipart_upload import MultipartUploadPart
+from mlflow.exceptions import (
+    MlflowException,
+    MlflowTraceDataCorrupted,
+    _UnsupportedMultipartUploadException,
+)
+from mlflow.store.artifact.artifact_repo import try_read_trace_data
 from mlflow.store.artifact.artifact_repository_registry import get_artifact_repository
 from mlflow.store.artifact.azure_blob_artifact_repo import AzureBlobArtifactRepository
-
 
 TEST_ROOT_PATH = "some/path"
 TEST_BLOB_CONTAINER_ROOT = "wasbs://container@account.blob.core.windows.net/"
 TEST_URI = os.path.join(TEST_BLOB_CONTAINER_ROOT, TEST_ROOT_PATH)
 
 
-class MockBlobList(object):
+class MockBlobList:
     def __init__(self, items, next_marker=None):
         self.items = items
         self.next_marker = next_marker
@@ -42,22 +52,19 @@ def mock_client():
         os.environ["AZURE_STORAGE_CONNECTION_STRING"] = old_conn_string
 
 
-def test_artifact_uri_factory(mock_client):
-    # pylint: disable=unused-argument
+def test_artifact_uri_factory(mock_client, monkeypatch):
     # We pass in the mock_client here to clear Azure environment variables, but we don't use it;
     # We do need to set up a fake access key for the code to run though
-    os.environ["AZURE_STORAGE_ACCESS_KEY"] = ""
+    monkeypatch.setenv("AZURE_STORAGE", "")
     repo = get_artifact_repository(TEST_URI)
     assert isinstance(repo, AzureBlobArtifactRepository)
-    del os.environ["AZURE_STORAGE_ACCESS_KEY"]
 
 
-@mock.patch("azure.identity.DefaultAzureCredential")
-def test_default_az_cred_if_no_env_vars(mock_default_azure_credential, mock_client):
-    # pylint: disable=unused-argument
+def test_default_az_cred_if_no_env_vars(mock_client):
     # We pass in the mock_client here to clear Azure environment variables, but we don't use it
-    AzureBlobArtifactRepository(TEST_URI)
-    assert mock_default_azure_credential.call_count == 1
+    with mock.patch("azure.identity.DefaultAzureCredential") as mock_default_azure_credential:
+        AzureBlobArtifactRepository(TEST_URI)
+        assert mock_default_azure_credential.call_count == 1
 
 
 def test_parse_global_wasbs_uri():
@@ -76,17 +83,17 @@ def test_parse_global_wasbs_uri():
     global_wasb_with_multi_path = "wasbs://cont@acct.blob.core.windows.net/a/b"
     assert parse(global_wasb_with_multi_path) == ("cont", "acct", "a/b", global_api_suffix)
 
-    with pytest.raises(Exception, match="WASBS URI must be of the form"):
+    with pytest.raises(MlflowException, match="WASBS URI must be of the form"):
         parse("wasbs://cont@acct.blob.core.evil.net/path")
-    with pytest.raises(Exception, match="WASBS URI must be of the form"):
+    with pytest.raises(MlflowException, match="WASBS URI must be of the form"):
         parse("wasbs://cont@acct/path")
-    with pytest.raises(Exception, match="WASBS URI must be of the form"):
+    with pytest.raises(MlflowException, match="WASBS URI must be of the form"):
         parse("wasbs://acct.blob.core.windows.net/path")
-    with pytest.raises(Exception, match="WASBS URI must be of the form"):
+    with pytest.raises(MlflowException, match="WASBS URI must be of the form"):
         parse("wasbs://@acct.blob.core.windows.net/path")
-    with pytest.raises(Exception, match="WASBS URI must be of the form"):
+    with pytest.raises(MlflowException, match="WASBS URI must be of the form"):
         parse("wasbs://cont@acctxblob.core.windows.net/path")
-    with pytest.raises(Exception, match="Not a WASBS URI"):
+    with pytest.raises(MlflowException, match="Not a WASBS URI"):
         parse("wasb://cont@acct.blob.core.windows.net/path")
 
 
@@ -106,28 +113,111 @@ def test_parse_cn_wasbs_uri():
     cn_wasb_with_multi_path = "wasbs://cont@acct.blob.core.chinacloudapi.cn/a/b"
     assert parse(cn_wasb_with_multi_path) == ("cont", "acct", "a/b", cn_api_suffix)
 
-    with pytest.raises(Exception, match="WASBS URI must be of the form"):
+    with pytest.raises(MlflowException, match="WASBS URI must be of the form"):
         parse("wasbs://cont@acct.blob.core.evil.cn/path")
-    with pytest.raises(Exception, match="WASBS URI must be of the form"):
+    with pytest.raises(MlflowException, match="WASBS URI must be of the form"):
         parse("wasbs://cont@acct/path")
-    with pytest.raises(Exception, match="WASBS URI must be of the form"):
+    with pytest.raises(MlflowException, match="WASBS URI must be of the form"):
         parse("wasbs://acct.blob.core.chinacloudapi.cn/path")
-    with pytest.raises(Exception, match="WASBS URI must be of the form"):
+    with pytest.raises(MlflowException, match="WASBS URI must be of the form"):
         parse("wasbs://@acct.blob.core.chinacloudapi.cn/path")
-    with pytest.raises(Exception, match="WASBS URI must be of the form"):
+    with pytest.raises(MlflowException, match="WASBS URI must be of the form"):
         parse("wasbs://cont@acctxblob.core.chinacloudapi.cn/path")
-    with pytest.raises(Exception, match="Not a WASBS URI"):
+    with pytest.raises(MlflowException, match="Not a WASBS URI"):
         parse("wasb://cont@acct.blob.core.chinacloudapi.cn/path")
 
 
+GOV_API_SUFFIX = "blob.core.usgovcloudapi.net"
+
+
+@pytest.mark.parametrize(
+    ("uri", "expected"),
+    [
+        (
+            "wasbs://cont@acct.blob.core.usgovcloudapi.net/path",
+            ("cont", "acct", "path", GOV_API_SUFFIX),
+        ),
+        (
+            "wasbs://cont@acct.blob.core.usgovcloudapi.net",
+            ("cont", "acct", "", GOV_API_SUFFIX),
+        ),
+        (
+            "wasbs://cont@acct.blob.core.usgovcloudapi.net/",
+            ("cont", "acct", "", GOV_API_SUFFIX),
+        ),
+        (
+            "wasbs://cont@acct.blob.core.usgovcloudapi.net/a/b",
+            ("cont", "acct", "a/b", GOV_API_SUFFIX),
+        ),
+    ],
+)
+def test_parse_govcloud_wasbs_uri_valid(uri, expected):
+    assert AzureBlobArtifactRepository.parse_wasbs_uri(uri) == expected
+
+
+@pytest.mark.parametrize(
+    ("uri", "error_match"),
+    [
+        ("wasbs://cont@acct.blob.core.evil.net/path", "WASBS URI must be of the form"),
+        ("wasbs://cont@acct/path", "WASBS URI must be of the form"),
+        ("wasbs://acct.blob.core.usgovcloudapi.net/path", "WASBS URI must be of the form"),
+        ("wasbs://@acct.blob.core.usgovcloudapi.net/path", "WASBS URI must be of the form"),
+        ("wasbs://cont@acctxblob.core.usgovcloudapi.net/path", "WASBS URI must be of the form"),
+        ("wasb://cont@acct.blob.core.usgovcloudapi.net/path", "Not a WASBS URI"),
+        # Ensure hosts with a valid suffix plus trailing components are rejected
+        (
+            "wasbs://cont@acct.blob.core.usgovcloudapi.net.evil.net/path",
+            "WASBS URI must be of the form",
+        ),
+        ("wasbs://cont@acct.blob.core.windows.net.evil.net/path", "WASBS URI must be of the form"),
+        (
+            "wasbs://cont@acct.blob.core.chinacloudapi.cn.evil.net/path",
+            "WASBS URI must be of the form",
+        ),
+    ],
+)
+def test_parse_govcloud_wasbs_uri_invalid(uri, error_match):
+    with pytest.raises(MlflowException, match=error_match):
+        AzureBlobArtifactRepository.parse_wasbs_uri(uri)
+
+
+@pytest.mark.parametrize(
+    "account",
+    [
+        "localhost\\",
+        "[::1]",
+        "[acct",
+        "localhost:8080\\",
+        "acct:443",
+        "ac%2Fct",
+        "ac-ct",
+        "ac ct",
+        "ac_ct",
+    ],
+)
+@pytest.mark.parametrize(
+    "suffix", ["blob.core.windows.net", "blob.core.chinacloudapi.cn", "blob.core.usgovcloudapi.net"]
+)
+def test_parse_wasbs_uri_rejects_non_alphanumeric_account(account, suffix):
+    with pytest.raises(MlflowException, match="WASBS URI must be of the form"):
+        AzureBlobArtifactRepository.parse_wasbs_uri(f"wasbs://cont@{account}.{suffix}/path")
+
+
+@pytest.mark.parametrize("account", ["acct", "Acct01", "mystorageaccount123"])
+def test_parse_wasbs_uri_accepts_alphanumeric_account(account):
+    assert AzureBlobArtifactRepository.parse_wasbs_uri(
+        f"wasbs://cont@{account}.blob.core.windows.net/path"
+    ) == ("cont", account, "path", "blob.core.windows.net")
+
+
 def test_list_artifacts_empty(mock_client):
-    repo = AzureBlobArtifactRepository(TEST_URI, mock_client)
+    repo = AzureBlobArtifactRepository(TEST_URI, client=mock_client)
     mock_client.get_container_client().walk_blobs.return_value = MockBlobList([])
     assert repo.list_artifacts() == []
 
 
 def test_list_artifacts_single_file(mock_client):
-    repo = AzureBlobArtifactRepository(TEST_URI, mock_client)
+    repo = AzureBlobArtifactRepository(TEST_URI, client=mock_client)
 
     # Evaluate single file
     blob_props = BlobProperties()
@@ -139,7 +229,7 @@ def test_list_artifacts_single_file(mock_client):
 @pytest.mark.parametrize("root_path", ["some/path", "some/path/"])
 def test_list_artifacts(mock_client, root_path):
     repo = AzureBlobArtifactRepository(
-        posixpath.join(TEST_BLOB_CONTAINER_ROOT, root_path), mock_client
+        posixpath.join(TEST_BLOB_CONTAINER_ROOT, root_path), client=mock_client
     )
 
     # Create some files to return
@@ -150,9 +240,10 @@ def test_list_artifacts(mock_client, root_path):
     blob_props.size = 42
     blob_props.name = posixpath.join(TEST_ROOT_PATH, "file")
 
-    mock_client.get_container_client().walk_blobs.return_value = MockBlobList(
-        [dir_prefix, blob_props]
-    )
+    mock_client.get_container_client().walk_blobs.return_value = MockBlobList([
+        dir_prefix,
+        blob_props,
+    ])
 
     artifacts = repo.list_artifacts()
     mock_client.get_container_client().walk_blobs.assert_called_with(name_starts_with="some/path/")
@@ -164,13 +255,14 @@ def test_list_artifacts(mock_client, root_path):
     assert artifacts[1].file_size == 42
 
 
-def test_log_artifact(mock_client, tmpdir):
-    repo = AzureBlobArtifactRepository(TEST_URI, mock_client)
+def test_log_artifact(mock_client, tmp_path):
+    repo = AzureBlobArtifactRepository(TEST_URI, client=mock_client)
 
-    d = tmpdir.mkdir("data")
-    f = d.join("test.txt")
-    f.write("hello world!")
-    fpath = posixpath.join(d.strpath, "test.txt")
+    d = tmp_path.joinpath("data")
+    d.mkdir()
+    f = d.joinpath("test.txt")
+    f.write_text("hello world!")
+    fpath = posixpath.join(str(d), "test.txt")
 
     repo.log_artifact(fpath)
 
@@ -181,16 +273,21 @@ def test_log_artifact(mock_client, tmpdir):
     assert arg2.name == fpath
 
 
-def test_log_artifacts(mock_client, tmpdir):
-    repo = AzureBlobArtifactRepository(TEST_URI, mock_client)
+def test_log_artifacts(mock_client, tmp_path):
+    repo = AzureBlobArtifactRepository(TEST_URI, client=mock_client)
 
-    parentd = tmpdir.mkdir("data")
-    subd = parentd.mkdir("subdir")
-    parentd.join("a.txt").write("A")
-    subd.join("b.txt").write("B")
-    subd.join("c.txt").write("C")
+    parentd = tmp_path.joinpath("data")
+    parentd.mkdir()
+    subd = parentd.joinpath("subdir")
+    subd.mkdir()
+    a_txt = parentd.joinpath("a.txt")
+    a_txt.write_text("A")
+    b_txt = subd.joinpath("b.txt")
+    b_txt.write_text("B")
+    c_txt = subd.joinpath("c.txt")
+    c_txt.write_text("C")
 
-    repo.log_artifacts(parentd.strpath)
+    repo.log_artifacts(parentd)
 
     mock_client.get_container_client.assert_called_with("container")
     call_list = mock_client.get_container_client().upload_blob.call_args_list
@@ -203,40 +300,40 @@ def test_log_artifacts(mock_client, tmpdir):
         ]
         # arg2 should be a filebuffer
         if arg1.endswith("/a.txt"):
-            assert arg2.name == os.path.normpath(parentd.strpath + "/a.txt")
+            assert arg2.name == str(a_txt)
         elif arg1.endswith("/b.txt"):
-            assert arg2.name == os.path.normpath(subd.strpath + "/b.txt")
+            assert arg2.name == str(b_txt)
         elif arg1.endswith("/c.txt"):
-            assert arg2.name == os.path.normpath(subd.strpath + "/c.txt")
+            assert arg2.name == str(c_txt)
         else:
             # This should be unreachable
             assert False
 
 
-def test_download_file_artifact(mock_client, tmpdir):
-    repo = AzureBlobArtifactRepository(TEST_URI, mock_client)
+def test_download_file_artifact(mock_client, tmp_path):
+    repo = AzureBlobArtifactRepository(TEST_URI, client=mock_client)
 
     mock_client.get_container_client().walk_blobs.return_value = MockBlobList([])
 
     def create_file(buffer):
         local_path = os.path.basename(buffer.name)
-        f = tmpdir.join(local_path)
-        f.write("hello world!")
+        f = tmp_path.joinpath(local_path)
+        f.write_text("hello world!")
 
     mock_client.get_container_client().download_blob().readinto.side_effect = create_file
 
     repo.download_artifacts("test.txt")
-    assert os.path.exists(os.path.join(tmpdir.strpath, "test.txt"))
+    assert os.path.exists(os.path.join(tmp_path, "test.txt"))
     mock_client.get_container_client().download_blob.assert_called_with(
         posixpath.join(TEST_ROOT_PATH, "test.txt")
     )
 
 
 def test_download_directory_artifact_succeeds_when_artifact_root_is_not_blob_container_root(
-    mock_client, tmpdir
+    mock_client, tmp_path
 ):
     assert TEST_URI is not TEST_BLOB_CONTAINER_ROOT
-    repo = AzureBlobArtifactRepository(TEST_URI, mock_client)
+    repo = AzureBlobArtifactRepository(TEST_URI, client=mock_client)
 
     file_path_1 = "file_1"
     file_path_2 = "file_2"
@@ -257,7 +354,7 @@ def test_download_directory_artifact_succeeds_when_artifact_root_is_not_blob_con
         without recursively listing the same artifacts at every level of the
         directory traversal.
         """
-        # pylint: disable=unused-argument
+
         if posixpath.abspath(kwargs["name_starts_with"]) == posixpath.abspath(TEST_ROOT_PATH):
             return MockBlobList([blob_props_1, blob_props_2])
         else:
@@ -265,8 +362,8 @@ def test_download_directory_artifact_succeeds_when_artifact_root_is_not_blob_con
 
     def create_file(buffer):
         fname = os.path.basename(buffer.name)
-        f = tmpdir.join(fname)
-        f.write("hello world!")
+        f = tmp_path.joinpath(fname)
+        f.write_text("hello world!")
 
     mock_client.get_container_client().walk_blobs.side_effect = get_mock_listing
     mock_client.get_container_client().download_blob().readinto.side_effect = create_file
@@ -274,15 +371,15 @@ def test_download_directory_artifact_succeeds_when_artifact_root_is_not_blob_con
     # Ensure that the root directory can be downloaded successfully
     repo.download_artifacts("")
     # Ensure that the `mkfile` side effect copied all of the download artifacts into `tmpdir`
-    dir_contents = os.listdir(tmpdir.strpath)
+    dir_contents = os.listdir(tmp_path)
     assert file_path_1 in dir_contents
     assert file_path_2 in dir_contents
 
 
 def test_download_directory_artifact_succeeds_when_artifact_root_is_blob_container_root(
-    mock_client, tmpdir
+    mock_client, tmp_path
 ):
-    repo = AzureBlobArtifactRepository(TEST_BLOB_CONTAINER_ROOT, mock_client)
+    repo = AzureBlobArtifactRepository(TEST_BLOB_CONTAINER_ROOT, client=mock_client)
 
     subdir_path = "my_directory"
     dir_prefix = BlobPrefix()
@@ -306,7 +403,7 @@ def test_download_directory_artifact_succeeds_when_artifact_root_is_blob_contain
         `_download_artifacts_into` subroutine without recursively listing the same artifacts at
         every level of the directory traversal.
         """
-        # pylint: disable=unused-argument
+
         if posixpath.abspath(kwargs["name_starts_with"]) == "/":
             return MockBlobList([dir_prefix])
         if posixpath.abspath(kwargs["name_starts_with"]) == posixpath.abspath(subdir_path):
@@ -316,8 +413,8 @@ def test_download_directory_artifact_succeeds_when_artifact_root_is_blob_contain
 
     def create_file(buffer):
         fname = os.path.basename(buffer.name)
-        f = tmpdir.join(fname)
-        f.write("hello world!")
+        f = tmp_path.joinpath(fname)
+        f.write_text("hello world!")
 
     mock_client.get_container_client().walk_blobs.side_effect = get_mock_listing
     mock_client.get_container_client().download_blob().readinto.side_effect = create_file
@@ -325,7 +422,7 @@ def test_download_directory_artifact_succeeds_when_artifact_root_is_blob_contain
     # Ensure that the root directory can be downloaded successfully
     repo.download_artifacts("")
     # Ensure that the `mkfile` side effect copied all of the download artifacts into `tmpdir`
-    dir_contents = os.listdir(tmpdir.strpath)
+    dir_contents = os.listdir(tmp_path)
     assert file_path_1 in dir_contents
     assert file_path_2 in dir_contents
 
@@ -333,7 +430,7 @@ def test_download_directory_artifact_succeeds_when_artifact_root_is_blob_contain
 def test_download_artifact_throws_value_error_when_listed_blobs_do_not_contain_artifact_root_prefix(
     mock_client,
 ):
-    repo = AzureBlobArtifactRepository(TEST_URI, mock_client)
+    repo = AzureBlobArtifactRepository(TEST_URI, client=mock_client)
 
     # Create a "bad blob" with a name that is not prefixed by the root path of the artifact store
     bad_blob_props = BlobProperties()
@@ -348,7 +445,7 @@ def test_download_artifact_throws_value_error_when_listed_blobs_do_not_contain_a
         without recursively listing the same artifacts at every level of the
         directory traversal.
         """
-        # pylint: disable=unused-argument
+
         if posixpath.abspath(kwargs["name_starts_with"]) == posixpath.abspath(TEST_ROOT_PATH):
             # Return a blob that is not prefixed by the root path of the artifact store. This
             # should result in an exception being raised
@@ -358,7 +455,283 @@ def test_download_artifact_throws_value_error_when_listed_blobs_do_not_contain_a
 
     mock_client.get_container_client().walk_blobs.side_effect = get_mock_listing
 
-    with pytest.raises(MlflowException) as exc:
+    with pytest.raises(
+        MlflowException, match="Azure blob does not begin with the specified artifact path"
+    ):
         repo.download_artifacts("")
 
-    assert "Azure blob does not begin with the specified artifact path" in str(exc)
+
+def test_create_multipart_upload_with_account_key(mock_client):
+    repo = AzureBlobArtifactRepository(TEST_URI, client=mock_client)
+
+    mock_client.url = "some-url"
+    mock_client.account_name = "some-account"
+    account_key = base64.b64encode(b"some-key").decode("utf-8")
+    mock_client.credential.account_key = account_key
+
+    with mock.patch("azure.storage.blob.generate_blob_sas", return_value="sas") as generate_sas:
+        create = repo.create_multipart_upload("local_file")
+
+    assert create.upload_id is None
+    assert len(create.credentials) == 1
+    assert create.credentials[0].url.startswith(
+        "some-url/container/some/path/local_file?comp=block"
+    )
+    assert generate_sas.call_args.kwargs["account_key"] == account_key
+    mock_client.get_user_delegation_key.assert_not_called()
+
+
+def test_create_multipart_upload_block_ids_have_same_length(mock_client):
+    repo = AzureBlobArtifactRepository(TEST_URI, client=mock_client)
+    mock_client.url = "some-url"
+    mock_client.account_name = "some-account"
+    mock_client.credential.account_key = base64.b64encode(b"some-key").decode("utf-8")
+
+    with mock.patch("azure.storage.blob.generate_blob_sas", return_value="sas"):
+        create = repo.create_multipart_upload("local_file", num_parts=1000)
+
+    block_ids = [
+        urllib.parse.parse_qs(urllib.parse.urlparse(c.url).query)["blockid"][0]
+        for c in create.credentials
+    ]
+    assert len(set(block_ids)) == 1000
+    assert len({len(b) for b in block_ids}) == 1
+
+
+def test_create_multipart_upload_with_token_credential(mock_client):
+    repo = AzureBlobArtifactRepository(TEST_URI, client=mock_client)
+    mock_client.url = "some-url"
+    mock_client.account_name = "some-account"
+    mock_client.credential = mock.Mock(spec=["get_token"])
+    user_delegation_key = mock_client.get_user_delegation_key.return_value
+
+    with mock.patch("azure.storage.blob.generate_blob_sas", return_value="sas") as generate_sas:
+        create = repo.create_multipart_upload("local_file")
+
+    assert create.credentials[0].url.endswith("&sas")
+    kwargs = generate_sas.call_args.kwargs
+    assert kwargs["user_delegation_key"] is user_delegation_key
+    assert "account_key" not in kwargs
+    assert kwargs["start"].tzinfo is not None
+    assert kwargs["start"] < kwargs["expiry"]
+    mock_client.get_user_delegation_key.assert_called_once_with(kwargs["start"], kwargs["expiry"])
+
+
+def test_create_multipart_upload_falls_back_when_delegation_key_is_forbidden(mock_client):
+    repo = AzureBlobArtifactRepository(TEST_URI, client=mock_client)
+    mock_client.credential = mock.Mock(spec=["get_token"])
+    response = mock.Mock(status_code=403)
+    error = HttpResponseError(response=response)
+    error.error_code = "AuthorizationPermissionMismatch"
+    mock_client.get_user_delegation_key.side_effect = error
+
+    with pytest.raises(
+        _UnsupportedMultipartUploadException,
+        match=_UnsupportedMultipartUploadException.MESSAGE,
+    ):
+        repo.create_multipart_upload("local_file")
+
+
+def test_create_multipart_upload_propagates_other_forbidden_errors(mock_client):
+    repo = AzureBlobArtifactRepository(TEST_URI, client=mock_client)
+    mock_client.credential = mock.Mock(spec=["get_token"])
+    error = HttpResponseError(response=mock.Mock(status_code=403))
+    error.error_code = "AuthorizationFailure"
+    mock_client.get_user_delegation_key.side_effect = error
+
+    with pytest.raises(HttpResponseError, match="Operation returned an invalid status") as exc_info:
+        repo.create_multipart_upload("local_file")
+
+    assert exc_info.value is error
+
+
+def test_create_multipart_upload_propagates_other_delegation_key_errors(mock_client):
+    repo = AzureBlobArtifactRepository(TEST_URI, client=mock_client)
+    mock_client.credential = mock.Mock(spec=["get_token"])
+    error = HttpResponseError(response=mock.Mock(status_code=500))
+    mock_client.get_user_delegation_key.side_effect = error
+
+    with pytest.raises(HttpResponseError, match="Operation returned an invalid status") as exc_info:
+        repo.create_multipart_upload("local_file")
+
+    assert exc_info.value is error
+
+
+@pytest.mark.parametrize("credential", [None, object(), AzureSasCredential("sas")])
+def test_create_multipart_upload_falls_back_for_unsupported_credentials(mock_client, credential):
+    repo = AzureBlobArtifactRepository(TEST_URI, client=mock_client)
+    mock_client.credential = credential
+
+    with pytest.raises(
+        _UnsupportedMultipartUploadException,
+        match=_UnsupportedMultipartUploadException.MESSAGE,
+    ):
+        repo.create_multipart_upload("local_file")
+
+    mock_client.get_user_delegation_key.assert_not_called()
+
+
+def test_complete_multipart_upload(mock_client, tmp_path):
+    repo = AzureBlobArtifactRepository(TEST_URI, client=mock_client)
+
+    parts = [
+        MultipartUploadPart(1, "", "some-url?comp=block&blockid=YQ%3D%3D%3D%3D"),
+        MultipartUploadPart(2, "", "some-url?comp=block&blockid=Yg%3D%3D%3D%3D"),
+    ]
+    repo.complete_multipart_upload("local_file", "", parts)
+    mock_client.get_blob_client.assert_called_with("container", f"{TEST_ROOT_PATH}/local_file")
+    mock_client.get_blob_client().commit_block_list.assert_called_with(["a", "b"])
+
+
+def test_trace_data(mock_client, tmp_path):
+    repo = AzureBlobArtifactRepository(TEST_URI, client=mock_client)
+    with pytest.raises(MlflowException, match=r"Trace data not found for path="):
+        repo.download_trace_data()
+    trace_data_path = tmp_path.joinpath("traces.json")
+    trace_data_path.write_text("invalid data")
+    with (
+        mock.patch(
+            "mlflow.store.artifact.artifact_repo.try_read_trace_data",
+            side_effect=lambda x: try_read_trace_data(trace_data_path),
+        ),
+        pytest.raises(MlflowTraceDataCorrupted, match=r"Trace data is corrupted for path="),
+    ):
+        repo.download_trace_data()
+
+    mock_trace_data = {"spans": [], "request": {"test": 1}, "response": {"test": 2}}
+    trace_data_path.write_text(json.dumps(mock_trace_data))
+    with mock.patch(
+        "mlflow.store.artifact.artifact_repo.try_read_trace_data",
+        side_effect=lambda x: try_read_trace_data(trace_data_path),
+    ):
+        assert repo.download_trace_data() == mock_trace_data
+
+
+def test_delete_artifacts_single_file(mock_client):
+    repo = AzureBlobArtifactRepository(TEST_URI, client=mock_client)
+
+    # Mock the list_blobs method to return a single file
+    blob_props = BlobProperties()
+    blob_props.name = posixpath.join(TEST_ROOT_PATH, "file")
+    mock_client.get_container_client().list_blobs.return_value = [blob_props]
+
+    repo.delete_artifacts("file")
+
+    mock_client.get_container_client().delete_blob.assert_called_with(blob_props.name)
+
+
+def test_delete_artifacts_directory(mock_client):
+    repo = AzureBlobArtifactRepository(TEST_URI, client=mock_client)
+
+    # Mock the list_blobs method to return multiple files in a directory
+    blob_props_1 = BlobProperties()
+    blob_props_1.name = posixpath.join(TEST_ROOT_PATH, "dir/file1")
+    blob_props_2 = BlobProperties()
+    blob_props_2.name = posixpath.join(TEST_ROOT_PATH, "dir/file2")
+    mock_client.get_container_client().list_blobs.return_value = [blob_props_1, blob_props_2]
+
+    repo.delete_artifacts("dir")
+
+    mock_client.get_container_client().delete_blob.assert_any_call(blob_props_1.name)
+    mock_client.get_container_client().delete_blob.assert_any_call(blob_props_2.name)
+
+
+@pytest.mark.parametrize("artifact_path", ["foo", "foo/"])
+def test_delete_artifacts_preserves_prefix_siblings(mock_client, artifact_path):
+    repo = AzureBlobArtifactRepository(TEST_URI, client=mock_client)
+    target = BlobProperties()
+    target.name = posixpath.join(TEST_ROOT_PATH, "foo/file")
+    sibling_dir = BlobProperties()
+    sibling_dir.name = posixpath.join(TEST_ROOT_PATH, "foobar/keep")
+    sibling_file = BlobProperties()
+    sibling_file.name = posixpath.join(TEST_ROOT_PATH, "foo_baz")
+    mock_client.get_container_client().list_blobs.return_value = [
+        target,
+        sibling_dir,
+        sibling_file,
+    ]
+
+    repo.delete_artifacts(artifact_path)
+
+    mock_client.get_container_client().list_blobs.assert_called_once_with(
+        name_starts_with=posixpath.join(TEST_ROOT_PATH, artifact_path)
+    )
+    mock_client.get_container_client().delete_blob.assert_called_once_with(target.name)
+
+
+def test_delete_artifacts_raises_when_only_sibling_path_matches_prefix(mock_client):
+    repo = AzureBlobArtifactRepository(TEST_URI, client=mock_client)
+    sibling = BlobProperties()
+    sibling.name = posixpath.join(TEST_ROOT_PATH, "foobar/keep")
+    mock_client.get_container_client().list_blobs.return_value = [sibling]
+
+    with pytest.raises(MlflowException, match="No such file or directory"):
+        repo.delete_artifacts("foo")
+
+    mock_client.get_container_client().delete_blob.assert_not_called()
+
+
+def test_delete_artifacts_nonexistent_path(mock_client):
+    repo = AzureBlobArtifactRepository(TEST_URI, client=mock_client)
+
+    # Mock the list_blobs method to return an empty list
+    mock_client.get_container_client().list_blobs.return_value = []
+
+    with pytest.raises(MlflowException, match="No such file or directory"):
+        repo.delete_artifacts("nonexistent_path")
+
+
+def test_delete_artifacts_failure(mock_client):
+    repo = AzureBlobArtifactRepository(TEST_URI, client=mock_client)
+
+    # Mock the list_blobs method to return a single file
+    blob_props = BlobProperties()
+    blob_props.name = posixpath.join(TEST_ROOT_PATH, "file")
+    mock_client.get_container_client().list_blobs.return_value = [blob_props]
+
+    # Mock the delete_blob method to raise an exception
+    mock_client.get_container_client().delete_blob.side_effect = ResourceNotFoundError(
+        "Deletion failed"
+    )
+
+    with pytest.raises(MlflowException, match=f"No such file or directory: '{blob_props.name}'"):
+        repo.delete_artifacts("file")
+
+
+def test_delete_artifacts_folder(mock_client):
+    repo = AzureBlobArtifactRepository(TEST_URI, client=mock_client)
+
+    # Mock the list_blobs method to return multiple files in a folder
+    blob_props_1 = BlobProperties()
+    blob_props_1.name = posixpath.join(TEST_ROOT_PATH, "folder/file1")
+    blob_props_2 = BlobProperties()
+    blob_props_2.name = posixpath.join(TEST_ROOT_PATH, "folder/file2")
+    mock_client.get_container_client().list_blobs.return_value = [blob_props_1, blob_props_2]
+
+    repo.delete_artifacts("folder")
+
+    mock_client.get_container_client().delete_blob.assert_any_call(blob_props_1.name)
+    mock_client.get_container_client().delete_blob.assert_any_call(blob_props_2.name)
+
+
+def test_delete_artifacts_folder_with_nested_folders_and_files(mock_client):
+    repo = AzureBlobArtifactRepository(TEST_URI, client=mock_client)
+
+    # Mock the list_blobs method to return multiple files in a folder with nested folders and files
+    blob_props_1 = BlobProperties()
+    blob_props_1.name = posixpath.join(TEST_ROOT_PATH, "folder/nested_folder/file1")
+    blob_props_2 = BlobProperties()
+    blob_props_2.name = posixpath.join(TEST_ROOT_PATH, "folder/nested_folder/file2")
+    blob_props_3 = BlobProperties()
+    blob_props_3.name = posixpath.join(TEST_ROOT_PATH, "folder/nested_folder/nested_file")
+    mock_client.get_container_client().list_blobs.return_value = [
+        blob_props_1,
+        blob_props_2,
+        blob_props_3,
+    ]
+
+    repo.delete_artifacts("folder")
+
+    mock_client.get_container_client().delete_blob.assert_any_call(blob_props_1.name)
+    mock_client.get_container_client().delete_blob.assert_any_call(blob_props_2.name)
+    mock_client.get_container_client().delete_blob.assert_any_call(blob_props_3.name)

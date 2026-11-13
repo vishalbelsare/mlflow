@@ -1,0 +1,414 @@
+import { describe, jest, beforeEach, test, expect } from '@jest/globals';
+import userEvent from '@testing-library/user-event';
+import { renderWithDesignSystem, screen } from '../../../common/utils/TestUtils.react18';
+import { BudgetsList } from './BudgetsList';
+import { useBudgetPoliciesQuery } from '../../hooks/useBudgetPoliciesQuery';
+import { useBudgetWindowsQuery } from '../../hooks/useBudgetWindowsQuery';
+import { useEndpointsQuery } from '../../hooks/useEndpointsQuery';
+import { getWorkspacesEnabledSync } from '../../../experiment-tracking/hooks/useServerInfo';
+import { MemoryRouter } from '../../../common/utils/RoutingUtils';
+
+jest.mock('../../hooks/useBudgetPoliciesQuery');
+jest.mock('../../hooks/useBudgetWindowsQuery');
+jest.mock('../../hooks/useEndpointsQuery');
+jest.mock('../../../experiment-tracking/hooks/useServerInfo', () => ({
+  ...jest.requireActual<typeof import('../../../experiment-tracking/hooks/useServerInfo')>(
+    '../../../experiment-tracking/hooks/useServerInfo',
+  ),
+  getWorkspacesEnabledSync: jest.fn(),
+}));
+
+const now = Date.now() / 1000;
+
+const mockPolicies = [
+  {
+    budget_policy_id: 'bp-1',
+    budget_unit: 'USD' as const,
+    budget_amount: 100,
+    duration: { unit: 'DAYS' as const, value: 1 },
+    target_scope: 'GLOBAL' as const,
+    budget_action: 'REJECT' as const,
+    created_at: now,
+    last_updated_at: now,
+  },
+  {
+    budget_policy_id: 'bp-2',
+    budget_unit: 'USD' as const,
+    budget_amount: 500.5,
+    duration: { unit: 'MONTHS' as const, value: 1 },
+    target_scope: 'WORKSPACE' as const,
+    budget_action: 'ALERT' as const,
+    created_at: now,
+    last_updated_at: now,
+  },
+];
+
+describe('BudgetsList', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    jest.mocked(getWorkspacesEnabledSync).mockReturnValue(false);
+    jest.mocked(useBudgetWindowsQuery).mockReturnValue({
+      data: {},
+      isLoading: false,
+      error: undefined,
+    });
+    jest.mocked(useEndpointsQuery).mockReturnValue({
+      data: [{ endpoint_id: 'e-1', name: 'my-endpoint' }],
+      isLoading: false,
+      error: undefined,
+      refetch: jest.fn(),
+    } as any);
+  });
+
+  test('renders loading state', () => {
+    jest.mocked(useBudgetPoliciesQuery).mockReturnValue({
+      data: [],
+      isLoading: true,
+      error: undefined,
+      refetch: jest.fn(),
+    } as any);
+
+    renderWithDesignSystem(
+      <MemoryRouter>
+        <BudgetsList />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByText('Loading budget policies...')).toBeInTheDocument();
+  });
+
+  test('renders empty state when no policies', () => {
+    jest.mocked(useBudgetPoliciesQuery).mockReturnValue({
+      data: [],
+      isLoading: false,
+      error: undefined,
+      refetch: jest.fn(),
+    } as any);
+
+    renderWithDesignSystem(
+      <MemoryRouter>
+        <BudgetsList />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByText('No budget policies created')).toBeInTheDocument();
+  });
+
+  test('renders policies with formatted data', () => {
+    jest.mocked(useBudgetPoliciesQuery).mockReturnValue({
+      data: mockPolicies,
+      isLoading: false,
+      error: undefined,
+      refetch: jest.fn(),
+    } as any);
+
+    renderWithDesignSystem(
+      <MemoryRouter>
+        <BudgetsList />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByText('$100')).toBeInTheDocument();
+    expect(screen.getByText('$500.5')).toBeInTheDocument();
+    expect(screen.getByText('Daily')).toBeInTheDocument();
+    expect(screen.getByText('Monthly')).toBeInTheDocument();
+    expect(screen.getByText('Reject')).toBeInTheDocument();
+    expect(screen.getByText('Alert')).toBeInTheDocument();
+    // GLOBAL and WORKSPACE policies both display as applying to everything.
+    expect(screen.getAllByText('All endpoints and users')).toHaveLength(2);
+  });
+
+  test('tells GLOBAL and WORKSPACE policies apart when workspaces are enabled', () => {
+    jest.mocked(getWorkspacesEnabledSync).mockReturnValue(true);
+    jest.mocked(useBudgetPoliciesQuery).mockReturnValue({
+      data: mockPolicies,
+      isLoading: false,
+      error: undefined,
+      refetch: jest.fn(),
+    } as any);
+
+    renderWithDesignSystem(
+      <MemoryRouter>
+        <BudgetsList />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByText('All endpoints and users in all workspaces')).toBeInTheDocument();
+    expect(screen.getByText('All endpoints and users in this workspace')).toBeInTheDocument();
+  });
+
+  test('renders endpoint name for ENDPOINT-scoped policy', () => {
+    jest.mocked(useBudgetPoliciesQuery).mockReturnValue({
+      data: [
+        {
+          ...mockPolicies[0],
+          budget_policy_id: 'bp-ep',
+          target_scope: 'ENDPOINT' as const,
+          target_value: 'e-1',
+        },
+      ],
+      isLoading: false,
+      error: undefined,
+      refetch: jest.fn(),
+    } as any);
+
+    renderWithDesignSystem(
+      <MemoryRouter>
+        <BudgetsList />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByText('my-endpoint')).toBeInTheDocument();
+    expect(screen.queryByText('All endpoints and users')).not.toBeInTheDocument();
+  });
+
+  test('marks an endpoint missing from the endpoint list as unavailable', async () => {
+    // The endpoint may have been deleted, or auth may have filtered it out of
+    // the list for this user, so the marker must not claim either one.
+    jest.mocked(useBudgetPoliciesQuery).mockReturnValue({
+      data: [
+        {
+          ...mockPolicies[0],
+          budget_policy_id: 'bp-ep',
+          target_scope: 'ENDPOINT' as const,
+          target_value: 'e-missing',
+        },
+      ],
+      isLoading: false,
+      error: undefined,
+      refetch: jest.fn(),
+    } as any);
+
+    renderWithDesignSystem(
+      <MemoryRouter>
+        <BudgetsList />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByText('e-missing')).toBeInTheDocument();
+    await userEvent.hover(screen.getByText('Unavailable'));
+    expect(await screen.findByRole('tooltip')).toHaveTextContent(
+      "This endpoint was deleted, or you don't have access to it. If it was deleted, edit the policy to choose another endpoint, or delete the policy.",
+    );
+  });
+
+  test.each([
+    ['still loading', { data: [], isLoading: true, error: undefined }],
+    ['failed', { data: [], isLoading: false, error: new Error('nope') }],
+  ])('does not mark an endpoint unavailable when the endpoints request is %s', (_label, endpointsQuery) => {
+    jest.mocked(useEndpointsQuery).mockReturnValue({ ...endpointsQuery, refetch: jest.fn() } as any);
+    jest.mocked(useBudgetPoliciesQuery).mockReturnValue({
+      data: [
+        {
+          ...mockPolicies[0],
+          budget_policy_id: 'bp-ep',
+          target_scope: 'ENDPOINT' as const,
+          target_value: 'e-1',
+        },
+      ],
+      isLoading: false,
+      error: undefined,
+      refetch: jest.fn(),
+    } as any);
+
+    renderWithDesignSystem(
+      <MemoryRouter>
+        <BudgetsList />
+      </MemoryRouter>,
+    );
+
+    // 'e-1' is live; we just can't resolve its name yet.
+    expect(screen.getByText('e-1')).toBeInTheDocument();
+    expect(screen.queryByText('Unavailable')).not.toBeInTheDocument();
+  });
+
+  test('renders the applies-to column for user and non-user policies', () => {
+    jest.mocked(useBudgetPoliciesQuery).mockReturnValue({
+      data: [
+        mockPolicies[0],
+        {
+          ...mockPolicies[0],
+          budget_policy_id: 'bp-user',
+          target_scope: 'USER' as const,
+          target_value: 'alice',
+        },
+      ],
+      isLoading: false,
+      error: undefined,
+      refetch: jest.fn(),
+    } as any);
+
+    renderWithDesignSystem(
+      <MemoryRouter>
+        <BudgetsList />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByText('Applies to')).toBeInTheDocument();
+    // The GLOBAL policy applies to everyone; the USER policy shows its username
+    // behind a "User" tag so it can't be read as an endpoint name.
+    expect(screen.getByText('All endpoints and users')).toBeInTheDocument();
+    expect(screen.getByText('alice')).toBeInTheDocument();
+    expect(screen.getByText('User')).toBeInTheDocument();
+  });
+
+  test('renders window columns with spend data when available', () => {
+    jest.mocked(useBudgetPoliciesQuery).mockReturnValue({
+      data: [mockPolicies[0]],
+      isLoading: false,
+      error: undefined,
+      refetch: jest.fn(),
+    } as any);
+
+    jest.mocked(useBudgetWindowsQuery).mockReturnValue({
+      data: {
+        'bp-1': {
+          budget_policy_id: 'bp-1',
+          window_start_ms: new Date('2026-03-01T00:00:00Z').getTime(),
+          window_end_ms: new Date('2026-03-02T00:00:00Z').getTime(),
+          current_spend: 42.5,
+        },
+      },
+      isLoading: false,
+      error: undefined,
+    });
+
+    renderWithDesignSystem(
+      <MemoryRouter>
+        <BudgetsList />
+      </MemoryRouter>,
+    );
+
+    // Current spend should be formatted as budget amount
+    expect(screen.getByText('$42.5')).toBeInTheDocument();
+  });
+
+  test('shows violation indicator when current spend exceeds budget', () => {
+    jest.mocked(useBudgetPoliciesQuery).mockReturnValue({
+      data: [mockPolicies[0]], // budget_amount: 100
+      isLoading: false,
+      error: undefined,
+      refetch: jest.fn(),
+    } as any);
+
+    jest.mocked(useBudgetWindowsQuery).mockReturnValue({
+      data: {
+        'bp-1': {
+          budget_policy_id: 'bp-1',
+          window_start_ms: new Date('2026-03-01T00:00:00Z').getTime(),
+          window_end_ms: new Date('2026-03-02T00:00:00Z').getTime(),
+          current_spend: 120, // exceeds budget_amount of 100
+        },
+      },
+      isLoading: false,
+      error: undefined,
+    });
+
+    renderWithDesignSystem(
+      <MemoryRouter>
+        <BudgetsList />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByText('$120')).toBeInTheDocument();
+    expect(screen.getByLabelText('Budget exceeded')).toBeInTheDocument();
+  });
+
+  test('does not show violation indicator when spend is within budget', () => {
+    jest.mocked(useBudgetPoliciesQuery).mockReturnValue({
+      data: [mockPolicies[0]], // budget_amount: 100
+      isLoading: false,
+      error: undefined,
+      refetch: jest.fn(),
+    } as any);
+
+    jest.mocked(useBudgetWindowsQuery).mockReturnValue({
+      data: {
+        'bp-1': {
+          budget_policy_id: 'bp-1',
+          window_start_ms: new Date('2026-03-01T00:00:00Z').getTime(),
+          window_end_ms: new Date('2026-03-02T00:00:00Z').getTime(),
+          current_spend: 50, // within budget_amount of 100
+        },
+      },
+      isLoading: false,
+      error: undefined,
+    });
+
+    renderWithDesignSystem(
+      <MemoryRouter>
+        <BudgetsList />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByText('$50')).toBeInTheDocument();
+    expect(screen.queryByLabelText('Budget exceeded')).not.toBeInTheDocument();
+  });
+
+  test('renders dash placeholders when no window data exists', () => {
+    jest.mocked(useBudgetPoliciesQuery).mockReturnValue({
+      data: [mockPolicies[0]],
+      isLoading: false,
+      error: undefined,
+      refetch: jest.fn(),
+    } as any);
+
+    jest.mocked(useBudgetWindowsQuery).mockReturnValue({
+      data: {},
+      isLoading: false,
+      error: undefined,
+    });
+
+    renderWithDesignSystem(
+      <MemoryRouter>
+        <BudgetsList />
+      </MemoryRouter>,
+    );
+
+    // Should show em-dash placeholders for missing window data
+    const dashes = screen.getAllByText('—');
+    expect(dashes.length).toBe(3); // Window Start, Window End, Current Spend
+  });
+
+  test('calls onEditClick when edit button is clicked', async () => {
+    const onEditClick = jest.fn();
+
+    jest.mocked(useBudgetPoliciesQuery).mockReturnValue({
+      data: [mockPolicies[0]],
+      isLoading: false,
+      error: undefined,
+      refetch: jest.fn(),
+    } as any);
+
+    renderWithDesignSystem(
+      <MemoryRouter>
+        <BudgetsList onEditClick={onEditClick} />
+      </MemoryRouter>,
+    );
+
+    await userEvent.click(screen.getByLabelText('Edit budget policy'));
+
+    expect(onEditClick).toHaveBeenCalledWith(mockPolicies[0]);
+  });
+
+  test('calls onDeleteClick when delete button is clicked', async () => {
+    const onDeleteClick = jest.fn();
+
+    jest.mocked(useBudgetPoliciesQuery).mockReturnValue({
+      data: [mockPolicies[0]],
+      isLoading: false,
+      error: undefined,
+      refetch: jest.fn(),
+    } as any);
+
+    renderWithDesignSystem(
+      <MemoryRouter>
+        <BudgetsList onDeleteClick={onDeleteClick} />
+      </MemoryRouter>,
+    );
+
+    await userEvent.click(screen.getByLabelText('Delete budget policy'));
+
+    expect(onDeleteClick).toHaveBeenCalledWith(mockPolicies[0]);
+  });
+});

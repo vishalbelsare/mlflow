@@ -1,3 +1,8 @@
+# This file is used by tests (e.g., tests/projects/utils.py:docker_example_base_image)
+# to exclude unnecessary files when copying the MLflow source tree for Docker builds.
+# Without this file, Docker images built during testing would be extremely large and
+# could cause disk space issues.
+
 .git
 mlruns
 docs
@@ -8,8 +13,7 @@ examples
 
 dev
 # required for Docker build
-!requirements/small-requirements.txt
-!requirements/large-requirements.txt
+!requirements/test-requirements.txt
 !requirements/lint-requirements.txt
 !requirements/extra-ml-requirements.txt
 

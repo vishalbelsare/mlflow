@@ -16,6 +16,7 @@ First, launch the tracking server with the artifacts service via `mlflow server`
 ```sh
 # Launch a tracking server with the artifacts service
 $ mlflow server \
+    --backend-store-uri=mlruns \
     --artifacts-destination ./mlartifacts \
     --default-artifact-root http://localhost:5000/api/2.0/mlflow-artifacts/artifacts/experiments \
     --gunicorn-opts "--log-level debug"
@@ -26,6 +27,7 @@ Notes:
 - `--artifacts-destination` specifies the base artifact location from which to resolve artifact upload/download/list requests. In this examples, we're using a local directory `./mlartifacts`, but it can be changed to a s3 bucket or
 - `--default-artifact-root` points to the `experiments` directory of the artifacts service. Therefore, the default artifact location of a newly-created experiment is set to `./mlartifacts/experiments/<experiment_id>`.
 - `--gunicorn-opts "--log-level debug"` is specified to print out request logs but can be omitted if unnecessary.
+- `--artifacts-only` disables all other endpoints for the tracking server apart from those involved in listing, uploading, and downloading artifacts. This makes the MLflow server a single-purpose proxy for artifact handling only.
 
 Then, run `example.py` that performs upload, download, and list operations for artifacts:
 
@@ -62,6 +64,12 @@ mlartifacts
 5 directories, 2 files
 ```
 
+To delete the logged artifacts, run the following command:
+
+```bash
+mlflow gc --backend-store-uri=mlruns --run-ids <run_id>
+```
+
 ### Clean up
 
 ```sh
@@ -77,7 +85,7 @@ $ rm -rf mlartifacts
 [`docker-compose.yml`](./docker-compose.yml) provides a more advanced setup than the quick-start example above:
 
 - Tracking service uses PostgreSQL as a backend store.
-- Artifact service uses MinIO as a artifact store.
+- Artifact service uses RustFS as an artifact store, with AWS CLI creating the S3 bucket.
 - Tracking and artifacts services are running on different servers.
 
 ```sh
@@ -91,7 +99,7 @@ $ docker-compose up -d
 $ docker-compose run -v ${PWD}/example.py:/app/example.py client python example.py
 ```
 
-You can view the logged artifacts on MinIO Console served at http://localhost:9001. The login username and password are `user` and `password`.
+You can view the logged artifacts on RustFS Console served at http://localhost:9001. The login username and password are `user` and `password`.
 
 ### Clean up
 

@@ -1,11 +1,3 @@
-FROM python:3.6
+FROM python:3.11
 
-WORKDIR /tmp/mlflow
-
-COPY dist ./dist
-
-RUN pip install dist/*.whl
-RUN pip install psycopg2 pymysql mysqlclient
-RUN pip list
-
-COPY log.py .
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/

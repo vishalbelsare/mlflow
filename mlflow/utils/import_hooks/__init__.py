@@ -11,10 +11,9 @@ It also extends the functionality to support custom hooks for import errors
 (as opposed to only successful imports).
 """
 
+import importlib.resources
 import sys
 import threading
-
-import importlib  # pylint: disable=unused-import
 
 string_types = (str,)
 
@@ -39,7 +38,7 @@ def synchronized(lock):
 # The dictionary registering any post import hooks to be triggered once
 # the target module has been imported. Once a module has been imported
 # and the hooks fired, the list of hooks recorded against the target
-# module will be truncacted but the list left in the dictionary. This
+# module will be truncated but the list left in the dictionary. This
 # acts as a flag to indicate that the module had already been imported.
 
 _post_import_hooks = {}
@@ -74,13 +73,30 @@ def _create_import_hook_from_string(name):
     return import_hook
 
 
-def register_generic_import_hook(hook, name, hook_dict, overwrite):
+def register_generic_import_hook(hook, name, hook_dict, overwrite, lock):
     # Create a deferred import hook if hook is a string name rather than
     # a callable function.
 
     if isinstance(hook, string_types):
         hook = _create_import_hook_from_string(hook)
 
+    # Update the registry under the lock, but fire the hook only after
+    # releasing it. Hooks may trigger imports of modules that another
+    # thread is loading, and that thread may be waiting for this lock in
+    # `ImportHookFinder.find_spec`, which would deadlock.
+
+    with lock:
+        module = _register_generic_import_hook(hook, name, hook_dict, overwrite)
+
+    if module is not None:
+        hook(module)
+
+
+def _register_generic_import_hook(hook, name, hook_dict, overwrite):
+    """
+    Registers the hook and returns the target module if it has already been
+    imported and the hook should be fired immediately, otherwise None.
+    """
     # Automatically install the import hook finder if it has not already
     # been installed.
 
@@ -106,18 +122,16 @@ def register_generic_import_hook(hook, name, hook_dict, overwrite):
 
         if module is not None:
             hook_dict[name] = []
-            hook(module)
+            return module
 
-        else:
-            hook_dict[name] = [hook]
+        hook_dict[name] = [hook]
 
     elif hooks == []:
         # A prior registration of import hooks for the target
         # module was done and the hooks already fired. Fire the hook
         # immediately.
 
-        module = sys.modules[name]
-        hook(module)
+        return sys.modules[name]
 
     else:
         # A prior registration of import hooks for the target
@@ -138,32 +152,41 @@ def register_generic_import_hook(hook, name, hook_dict, overwrite):
 
         hook_dict[name].append(hook)
 
+    return None
 
-@synchronized(_import_error_hooks_lock)
+
 def register_import_error_hook(hook, name, overwrite=True):
     """
-    :param hook: A function or string entrypoint to invoke when the specified module is imported
-                 and an error occurs.
-    :param name: The name of the module for which to fire the hook at import error detection time.
-    :param overwrite: Specifies the desired behavior when a preexisting hook for the same
-                      function / entrypoint already exists for the specified module. If `True`,
-                      all preexisting hooks matching the specified function / entrypoint will be
-                      removed and replaced with a single instance of the specified `hook`.
+    Args:
+        hook: A function or string entrypoint to invoke when the specified module is imported
+            and an error occurs.
+        name: The name of the module for which to fire the hook at import error detection time.
+        overwrite: Specifies the desired behavior when a preexisting hook for the same
+            function / entrypoint already exists for the specified module. If `True`,
+            all preexisting hooks matching the specified function / entrypoint will be
+            removed and replaced with a single instance of the specified `hook`.
     """
-    register_generic_import_hook(hook, name, _import_error_hooks, overwrite)
+    register_generic_import_hook(
+        hook, name, _import_error_hooks, overwrite, _import_error_hooks_lock
+    )
+
+
+def register_post_import_hook(hook, name, overwrite=True):
+    """
+    Args:
+        hook: A function or string entrypoint to invoke when the specified module is imported.
+        name: The name of the module for which to fire the hook at import time.
+        overwrite: Specifies the desired behavior when a preexisting hook for the same
+            function / entrypoint already exists for the specified module. If `True`,
+            all preexisting hooks matching the specified function / entrypoint will be
+            removed and replaced with a single instance of the specified `hook`.
+    """
+    register_generic_import_hook(hook, name, _post_import_hooks, overwrite, _post_import_hooks_lock)
 
 
 @synchronized(_post_import_hooks_lock)
-def register_post_import_hook(hook, name, overwrite=True):
-    """
-    :param hook: A function or string entrypoint to invoke when the specified module is imported.
-    :param name: The name of the module for which to fire the hook at import time.
-    :param overwrite: Specifies the desired behavior when a preexisting hook for the same
-                      function / entrypoint already exists for the specified module. If `True`,
-                      all preexisting hooks matching the specified function / entrypoint will be
-                      removed and replaced with a single instance of the specified `hook`.
-    """
-    register_generic_import_hook(hook, name, _post_import_hooks, overwrite)
+def get_post_import_hooks(name):
+    return _post_import_hooks.get(name)
 
 
 # Register post import hooks defined as package entry points.
@@ -181,12 +204,11 @@ def _create_import_hook_from_entrypoint(entrypoint):
 
 
 def discover_post_import_hooks(group):
-    try:
-        import pkg_resources
-    except ImportError:
-        return
-
-    for entrypoint in pkg_resources.iter_entry_points(group=group):
+    for entrypoint in (
+        resource.name
+        for resource in importlib.resources.files(group).iterdir()
+        if resource.is_file()
+    ):
         callback = _create_import_hook_from_entrypoint(entrypoint)
         register_post_import_hook(callback, entrypoint.name)
 
@@ -197,27 +219,29 @@ def discover_post_import_hooks(group):
 # the import of the target module to fail.
 
 
-@synchronized(_post_import_hooks_lock)
 def notify_module_loaded(module):
+    # Snapshot hooks under the lock, then release it before firing them. Hooks
+    # may trigger imports that re-enter the import machinery on another thread
+    # and try to acquire this lock, which would deadlock against per-module
+    # import locks held by that thread.
     name = getattr(module, "__name__", None)
-    hooks = _post_import_hooks.get(name, None)
+    with _post_import_hooks_lock:
+        hooks = _post_import_hooks.get(name) or []
+        if hooks:
+            _post_import_hooks[name] = []
 
-    if hooks:
-        _post_import_hooks[name] = []
-
-        for hook in hooks:
-            hook(module)
+    for hook in hooks:
+        hook(module)
 
 
-@synchronized(_import_error_hooks_lock)
 def notify_module_import_error(module_name):
-    hooks = _import_error_hooks.get(module_name, None)
-
-    if hooks:
+    with _import_error_hooks_lock:
         # Error hooks differ from post import hooks, in that we don't clear the
         # hook as soon as it fires.
-        for hook in hooks:
-            hook(module_name)
+        hooks = list(_import_error_hooks.get(module_name) or [])
+
+    for hook in hooks:
+        hook(module_name)
 
 
 # A custom module import finder. This intercepts attempts to import
@@ -278,14 +302,14 @@ class ImportHookFinder:
             # real loader to import the module and invoke the
             # post import hooks.
             try:
-                import importlib.util
+                import importlib.util  # clint: disable=lazy-import
 
                 loader = importlib.util.find_spec(fullname).loader
             # If an ImportError (or AttributeError) is encountered while finding the module,
             # notify the hooks for import errors
             except (ImportError, AttributeError):
                 notify_module_import_error(fullname)
-                loader = importlib.find_loader(fullname, path)  # pylint: disable=deprecated-method
+                loader = importlib.find_loader(fullname, path)
             if loader:
                 return _ImportHookChainedLoader(loader)
         finally:
@@ -293,7 +317,7 @@ class ImportHookFinder:
 
     @synchronized(_post_import_hooks_lock)
     @synchronized(_import_error_hooks_lock)
-    def find_spec(self, fullname, path, target=None):  # pylint: disable=unused-argument
+    def find_spec(self, fullname, path, target=None):
         # If the module being imported is not one we have registered
         # import hooks for, we can return immediately. We will
         # take no further part in the importing of this module.
@@ -316,7 +340,7 @@ class ImportHookFinder:
         # Now call back into the import system again.
 
         try:
-            import importlib.util
+            import importlib.util  # clint: disable=lazy-import
 
             spec = importlib.util.find_spec(fullname)
             # Replace the module spec's loader with a wrapped version that executes import

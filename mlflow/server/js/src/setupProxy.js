@@ -6,10 +6,28 @@ module.exports = function (app) {
   // (eg /ajax-api) to that port.
   // Exception: If the caller has specified an MLFLOW_PROXY, we instead forward server requests
   // there.
+  // eslint-disable-next-line no-undef
   const proxyTarget = process.env.MLFLOW_PROXY || 'http://localhost:5000/';
+  // eslint-disable-next-line no-undef
   const proxyStaticTarget = process.env.MLFLOW_STATIC_PROXY || proxyTarget;
   app.use(
     createProxyMiddleware('/ajax-api', {
+      target: proxyTarget,
+      changeOrigin: true,
+    }),
+  );
+  // Forward any REST (``/api``) traffic to the backend. The admin UI uses
+  // ``/ajax-api`` everywhere; this proxy is here for any future direct REST
+  // callers and to keep the dev server from returning its SPA fallback
+  // (200 + index.html) on accidental ``/api`` POSTs.
+  app.use(
+    createProxyMiddleware('/api', {
+      target: proxyTarget,
+      changeOrigin: true,
+    }),
+  );
+  app.use(
+    createProxyMiddleware('/graphql', {
       target: proxyTarget,
       changeOrigin: true,
     }),
@@ -18,6 +36,19 @@ module.exports = function (app) {
     createProxyMiddleware('/get-artifact', {
       target: proxyStaticTarget,
       ws: true,
+      changeOrigin: true,
+    }),
+  );
+  app.use(
+    createProxyMiddleware('/model-versions/get-artifact', {
+      target: proxyStaticTarget,
+      ws: true,
+      changeOrigin: true,
+    }),
+  );
+  app.use(
+    createProxyMiddleware('/gateway', {
+      target: proxyTarget,
       changeOrigin: true,
     }),
   );

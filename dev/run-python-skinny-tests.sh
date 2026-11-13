@@ -18,20 +18,42 @@ pytest tests/test_skinny_client_omits_sql_libs.py
 # After verifying skinny client does not include store specific requirements,
 # we are installing sqlalchemy store requirements as our example store for the test suite.
 # SQL Alchemy serves as a simple, fully featured option to test skinny client store scenarios.
-python -m pip install sqlalchemy alembic sqlparse
+uv pip install --system sqlalchemy alembic cryptography
 
 # Given the example store does not delete dependencies, we verify non store related dependencies
 # after the example store setup. This verifies both the example store and skinny client do not add
 # unintended libraries.
 pytest tests/test_skinny_client_omits_data_science_libs.py
 
-pytest tests/test_runs.py
-pytest tests/tracking/test_client.py
-pytest tests/tracking/test_tracking.py
-pytest tests/projects/test_projects.py
-pytest tests/deployments/test_cli.py
-pytest tests/deployments/test_deployments.py
-pytest tests/projects/test_projects_cli.py
-pytest tests/utils/test_requirements_utils.py::test_infer_requirements_excludes_mlflow
+# Verify that mlflow.types.chat can be imported without numpy (issue #21779)
+pytest tests/test_skinny_client_anthropic_import.py
+
+# Verify that flavor autologging works without numpy and pandas (issue #27005)
+uv pip install --system openai langchain-core dspy
+pytest tests/test_skinny_client_flavor_autolog.py -k "not llama_index_autolog_traces"
+
+# Install numpy that is required by mlflow.types.schema and pre-installed in DBR.
+uv pip install --system numpy
+
+pytest \
+  tests/test_runs.py \
+  tests/tracking/test_client.py \
+  tests/tracking/test_tracking.py \
+  tests/projects/test_projects.py \
+  tests/deployments/test_cli.py \
+  tests/deployments/test_deployments.py \
+  tests/projects/test_projects_cli.py \
+  tests/utils/test_requirements_utils.py::test_infer_requirements_excludes_mlflow \
+  tests/utils/test_search_utils.py \
+  tests/store/tracking/test_file_store.py \
+  tests/utils/test_doctor.py \
+  --import-mode=importlib
+
+# llama-index-core requires numpy, so test it after numpy is installed and before pandas is
+uv pip install --system llama-index-core
+pytest tests/test_skinny_client_flavor_autolog.py -k llama_index_autolog_traces
+
+uv pip install --system pandas
+pytest tests/test_skinny_client_autolog_without_scipy.py
 
 test $err = 0
